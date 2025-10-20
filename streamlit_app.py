@@ -461,3 +461,159 @@ with tab_outreach_load:
             mime="text/csv",
             key="t5_dl"
         )
+
+# ==========================================================
+# TAB 6 – Optimal FJ curve (interp toggle) — NEW
+# ==========================================================
+with tab_optimal_curve:
+    st.subheader("Optimal Folding Jib per Main Jib — Load vs Outreach")
+
+    # Select Duties (Cdyn)
+    all_duties = sorted(df["Duty"].dropna().unique().tolist())
+    duties_sel = st.multiselect(
+        "Select Duty (Cdyn) to plot",
+        all_duties,
+        default=[duty] if duty in all_duties else (all_duties[:1] if all_duties else [])
+    )
+
+    use_sidebar_filters = st.checkbox("Apply current FoldingJib/MainJib filters", value=False)
+
+    st.markdown("**Interpolation mode (PCHIP):**")
+    interp_mode = st.radio(
+        "Choose how to interpolate",
+        [
+            "None (discrete points)",
+            "Interpolate FoldingJib only (per MainJib)",
+            "Interpolate MainJib only (densify curve)",
+            "Interpolate both (FJ optimum + MJ densify)",
+        ],
+        index=3,
+        horizontal=False
+    )
+
+    col_interp = st.columns(2)
+    with col_interp[0]:
+        fj_step = st.slider("FoldingJib sampling step (deg) when interpolating FJ", 0.1, 5.0, 0.5, 0.1)
+    with col_interp[1]:
+        mj_step = st.slider("MainJib interpolation step (deg) when interpolating MJ", 0.1, 5.0, 0.5, 0.1)
+
+    fig, ax = plt.subplots(figsize=(9.5, 5.6))
+    last_plot_df = None
+    last_label = None
+
+    for dname in duties_sel:
+        W = df[df["Duty"] == dname].copy()
+        if use_sidebar_filters:
+            if sel_fj:
+                W = W[W["FoldingJib_deg"].isin(sel_fj)]
+            if sel_mj:
+                W = W[W["MainJib_deg"].isin(sel_mj)]
+        W = W.dropna(subset=["MainJib_deg", "FoldingJib_deg", "Outreach_m", "Capacity_t"])
+        if W.empty:
+            continue
+
+        # 1) Build optimal per MainJib
+        rows = []
+        for mj, g in W.groupby("MainJib_deg"):
+            g = g.dropna(subset=["FoldingJib_deg","Outreach_m","Capacity_t"])
+            if g.empty:
+                continue
+
+            if interp_mode in ["Interpolate FoldingJib only (per MainJib)", "Interpolate both (FJ optimum + MJ densify)"]:
+                # PCHIP along FJ at this MainJib
+                # Need at least 2 unique FJ points
+                g_sorted = g.sort_values("FoldingJib_deg")
+                fj_arr = g_sorted["FoldingJib_deg"].to_numpy()
+                # guard: need strictly increasing x for PCHIP
+                fj_unique, uniq_idx = np.unique(fj_arr, return_index=True)
+                if fj_unique.size >= 2:
+                    cap = g_sorted["Capacity_t"].to_numpy()[uniq_idx]
+                    out = g_sorted["Outreach_m"].to_numpy()[uniq_idx]
+                    fj_min, fj_max = float(fj_unique.min()), float(fj_unique.max())
+                    fj_grid = np.arange(fj_min, fj_max + 1e-9, fj_step)
+
+                    f_cap = PchipInterpolator(fj_unique, cap)
+                    f_out = PchipInterpolator(fj_unique, out)
+
+                    cap_i = f_cap(fj_grid)
+                    out_i = f_out(fj_grid)
+
+                    k = int(np.argmax(cap_i))
+                    rows.append({
+                        "MainJib_deg": float(mj),
+                        "FoldingJib_deg": float(fj_grid[k]),
+                        "Outreach_m": float(out_i[k]),
+                        "Load_t": float(cap_i[k])
+                    })
+                else:
+                    # fallback to discrete max if not enough FJ points
+                    gg = g.sort_values(["Capacity_t","Outreach_m"], ascending=[False, False]).iloc[0]
+                    rows.append({
+                        "MainJib_deg": float(mj),
+                        "FoldingJib_deg": float(gg["FoldingJib_deg"]),
+                        "Outreach_m": float(gg["Outreach_m"]),
+                        "Load_t": float(gg["Capacity_t"])
+                    })
+            else:
+                # No FJ interpolation: pick discrete optimal FJ (max load, tie-break by outreach)
+                gg = g.sort_values(["Capacity_t","Outreach_m"], ascending=[False, False]).iloc[0]
+                rows.append({
+                    "MainJib_deg": float(mj),
+                    "FoldingJib_deg": float(gg["FoldingJib_deg"]),
+                    "Outreach_m": float(gg["Outreach_m"]),
+                    "Load_t": float(gg["Capacity_t"])
+                })
+
+        if not rows:
+            continue
+
+        curve = pd.DataFrame(rows).sort_values("MainJib_deg")
+
+        # 2) Interpolate across MainJib if requested
+        if interp_mode in ["Interpolate MainJib only (densify curve)", "Interpolate both (FJ optimum + MJ densify)"] and len(curve) >= 2:
+            mj = curve["MainJib_deg"].to_numpy()
+            o  = curve["Outreach_m"].to_numpy()
+            l  = curve["Load_t"].to_numpy()
+
+            f_o = PchipInterpolator(mj, o)
+            f_l = PchipInterpolator(mj, l)
+
+            mj_i = np.arange(mj.min(), mj.max() + 1e-9, mj_step)
+            o_i  = f_o(mj_i)
+            l_i  = f_l(mj_i)
+
+            curve_plot = pd.DataFrame({
+                "MainJib_deg": mj_i,
+                "Outreach_m": o_i,
+                "Load_t": l_i
+            })
+        else:
+            curve_plot = curve
+
+        label_txt = f"{dname} — Optimal FJ per MJ" + (
+            " (FJ interp)" if "FoldingJib" in interp_mode else ""
+        ) + (
+            " + MJ interp" if "MainJib" in interp_mode else ""
+        )
+        ax.plot(curve_plot["Outreach_m"], curve_plot["Load_t"], linewidth=2.5, label=label_txt)
+
+        last_plot_df = curve_plot.copy()
+        last_label = label_txt.replace(" ", "_")
+
+    ax.set_xlabel("Outreach (m)")
+    ax.set_ylabel("Load (t)")
+    ax.grid(True, linestyle="-", linewidth=0.5, alpha=0.6)
+    ax.set_title("Maximum load vs outreach (Main Jib booming; Folding Jib at optimal position)")
+    if duties_sel:
+        ax.legend(loc="best")
+    st.pyplot(fig, clear_figure=True)
+
+    if last_plot_df is not None:
+        st.subheader("Data used for the last curve plotted")
+        st.dataframe(last_plot_df, use_container_width=True)
+        st.download_button(
+            "Download plotted curve (CSV)",
+            data=last_plot_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"optimal_fj_curve_{last_label}.csv",
+            mime="text/csv"
+        )
