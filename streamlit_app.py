@@ -307,3 +307,68 @@ with tabs[2]:
         file_name="swl_envelope_fixed_fj.csv",
         mime="text/csv"
     )
+# ===========================================
+# Tab 4: SWL vs MainJib (fixed FJ) — Diagnostic
+# ===========================================
+with tabs[3]:
+    st.subheader("SWL vs MainJib (fixed FoldingJib) — Diagnostic")
+
+    # Use the same Duty as in sidebar
+    w_all = df[df["Duty"] == duty].copy()
+
+    fj_all = sorted(df["FoldingJib_deg"].dropna().unique().tolist())
+    target_fj = st.number_input(
+        "Fixed FoldingJib (deg) for diagnostic",
+        min_value=float(min(fj_all)),
+        max_value=float(max(fj_all)),
+        value=float(fj_all[0]) if fj_all else 0.0,
+        step=0.01,
+        key="diag_fj"
+    )
+    fj_tol = st.number_input("FoldingJib tolerance (deg)", min_value=0.0, value=0.25, step=0.05, key="diag_tol")
+
+    w = w_all[(w_all["FoldingJib_deg"] >= target_fj - fj_tol) &
+              (w_all["FoldingJib_deg"] <= target_fj + fj_tol)].copy()
+    if w.empty:
+        st.warning("No rows for this Duty/FJ selection.")
+        st.stop()
+
+    # For each MainJib angle, find the maximum SWL and the outreach where that occurs
+    grp = (w.groupby("MainJib_deg")
+             .apply(lambda g: pd.Series({
+                 "SWL_t": g["Capacity_t"].max(),
+                 "Radius_at_max": g.loc[g["Capacity_t"].idxmax(), "Outreach_m"]
+             }))
+             .reset_index()
+             .sort_values("MainJib_deg"))
+
+    # (Optional) linear interpolation for missing MJ angles
+    interp = st.checkbox("Interpolate missing MainJib angles", value=True)
+    if interp and len(grp) >= 2:
+        mj = grp["MainJib_deg"].to_numpy()
+        swl = grp["SWL_t"].to_numpy()
+        mj_i = np.arange(mj.min(), mj.max() + 1e-9, 0.5)  # 0.5° grid
+        swl_i = np.interp(mj_i, mj, swl)
+        grp_plot = pd.DataFrame({"MainJib_deg": mj_i, "SWL_t": swl_i})
+    else:
+        grp_plot = grp[["MainJib_deg", "SWL_t"]].copy()
+
+    # Plot SWL vs MainJib
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(grp_plot["MainJib_deg"], grp_plot["SWL_t"], linewidth=2.5)
+    ax.set_xlabel("MainJib [deg]")
+    ax.set_ylabel("SWL [t]")
+    ax.set_title(f"SWL vs MainJib — Duty {duty}, FoldingJib≈{target_fj:.2f}°")
+    ax.grid(True, linestyle="-", linewidth=0.5, alpha=0.6)
+    st.pyplot(fig, clear_figure=True)
+
+    # Show the table (so you can compare directly to your list)
+    st.subheader("Table (per MainJib): max SWL and radius at which it occurs")
+    st.dataframe(grp[["MainJib_deg", "SWL_t", "Radius_at_max"]], use_container_width=True)
+
+    st.download_button(
+        "Download table (CSV)",
+        data=grp.to_csv(index=False).encode("utf-8"),
+        file_name="swl_vs_mainjib_fixed_fj.csv",
+        mime="text/csv"
+    )
