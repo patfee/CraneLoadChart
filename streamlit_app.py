@@ -220,93 +220,90 @@ with tabs[1]:
         st.dataframe(agg_df.sort_values(["Outreach_m","Height_m"]), use_container_width=True)
 
 # ============================
-# Tab 3: SWL Envelope (by Cdyn)
+# Tab 3: SWL Envelope (by Cdyn) — FIXED FJ
 # ============================
 with tabs[2]:
-    st.subheader("SWL Envelope (by Cdyn) — SWL [t] vs RADIUS [m]")
+    st.subheader("SWL Envelope (by Cdyn) — SWL [t] vs RADIUS [m] (fixed FoldingJib)")
 
     import re
     def duty_to_cdyn(d):
         m = re.search(r"Cd\s*([0-9]+)", d, flags=re.IGNORECASE)
         return (float(m.group(1)) / 100.0) if m else None
 
-    # Select duties to plot (compare curves)
-    all_duties = sorted(df["Duty"].dropna().unique().tolist())
-    selected_duties = st.multiselect(
-        "Select Duty / Cdyn to plot",
-        all_duties,
-        default=[duty] if duty in all_duties else all_duties[:1]
+    # Choose DUTY and a single FoldingJib value (nearest within tolerance)
+    # (We already picked Duty in sidebar; we re-use it here)
+    w_all = df[df["Duty"] == duty].copy()
+    fj_all = sorted(df["FoldingJib_deg"].dropna().unique().tolist())
+    target_fj = st.number_input(
+        "Fixed FoldingJib (deg)",
+        min_value=float(min(fj_all)),
+        max_value=float(max(fj_all)),
+        value=float(fj_all[0]) if fj_all else 0.0,
+        step=0.01
     )
+    fj_tol = st.number_input("FoldingJib tolerance (deg)", min_value=0.0, value=0.25, step=0.05)
 
-    col_a, col_b, col_c = st.columns([1,1,1])
-    with col_a:
-        # Bin size for smoothing the x-axis (radius). 0.5–1.0 m gives clean curves.
-        bin_step = st.number_input("Radius bin size (m)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
-    with col_b:
-        fill_under = st.checkbox("Fill under curve", value=False)
-    with col_c:
-        thick_line = st.checkbox("Use thick line style", value=True)
-
-    def bin_outreach(values, step):
-        # bin to multiples of step (e.g., 0.5 m): round(x/step)*step
-        return (np.round(values / step) * step).astype(float)
-
-    if len(selected_duties) == 0:
-        st.info("Select at least one Duty to plot.")
+    # Subset by |FJ - target| <= tol and by selected main-jib angles (if user filtered in sidebar)
+    w = w_all[(w_all["FoldingJib_deg"] >= target_fj - fj_tol) &
+              (w_all["FoldingJib_deg"] <= target_fj + fj_tol)].copy()
+    if sel_mj:
+        w = w[w["MainJib_deg"].isin(sel_mj)]
+    if w.empty:
+        st.warning("No rows for this Duty/FoldingJib selection.")
         st.stop()
 
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    last_env = None  # for download when a single duty is selected
+    # Envelope method:
+    #   1) For *each radius* take MAX capacity across heights & main-jib within the fixed FJ band.
+    #   2) Bin/round radius to reduce near-duplicates.
+    #   3) Optionally interpolate to a regular radius grid.
+    col_a, col_b, col_c = st.columns([1,1,1])
+    with col_a:
+        bin_step = st.number_input("Radius bin size (m)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+    with col_b:
+        enforce_monotonic = st.checkbox("Force monotonic decrease", value=True)
+    with col_c:
+        interpolate_grid = st.checkbox("Interpolate to regular grid", value=True)
 
-    for dsel in selected_duties:
-        w = df[df["Duty"] == dsel].copy()
-        if sel_fj:
-            w = w[w["FoldingJib_deg"].isin(sel_fj)]
-        if sel_mj:
-            w = w[w["MainJib_deg"].isin(sel_mj)]
-        if w.empty:
-            continue
+    def bin_outreach(values, step):
+        return (np.round(values / step) * step).astype(float)
 
-        # 1) Bin/round outreach to reduce near-duplicate x-points
-        w["Outreach_bin"] = bin_outreach(w["Outreach_m"], bin_step)
+    # Step 1–2: max per binned radius
+    w["Outreach_bin"] = bin_outreach(w["Outreach_m"], bin_step)
+    env = (w.groupby("Outreach_bin", as_index=False)
+             .agg(SWL_t=("Capacity_t", "max"))
+             .sort_values("Outreach_bin"))
 
-        # 2) Envelope per bin: take MAX capacity per radius bin
-        env = (w.groupby("Outreach_bin", as_index=False)
-                 .agg(SWL_t=("Capacity_t", "max"))
-                 .sort_values("Outreach_bin"))
+    # Step 3: optional interpolation to regular grid (nice straight segments)
+    if interpolate_grid and len(env) >= 2:
+        x_min, x_max = float(env["Outreach_bin"].min()), float(env["Outreach_bin"].max())
+        xi = np.arange(x_min, x_max + 1e-9, bin_step)
+        yi = np.interp(xi, env["Outreach_bin"].to_numpy(), env["SWL_t"].to_numpy())
+        env = pd.DataFrame({"Outreach_bin": xi, "SWL_t": yi})
 
-        # 3) Enforce monotonic non-increasing SWL vs radius (physical behavior)
+    # Enforce monotonic decrease (physically realistic crane curves)
+    if enforce_monotonic:
         env["SWL_t"] = env["SWL_t"].cummin()
 
-        # Optional: drop leading NaNs / tiny bins with no data (shouldn't occur after groupby)
-        env = env.dropna(subset=["Outreach_bin", "SWL_t"])
-
-        # Plot
-        lw = 3.0 if thick_line else 1.5
-        ax.plot(env["Outreach_bin"], env["SWL_t"], linewidth=lw, label=dsel)
-        if fill_under:
-            ax.fill_between(env["Outreach_bin"], env["SWL_t"], step=None, alpha=0.15)
-
-        last_env = env  # keep last for download if single selection
-
-    # Styling to match your reference
+    # Plot
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    lw = 3.0
+    ax.plot(env["Outreach_bin"], env["SWL_t"], linewidth=lw, label=f"{duty} @ FJ≈{target_fj:.2f}°")
     ax.set_xlabel("RADIUS [m]")
     ax.set_ylabel("SWL [t]")
     ax.set_title("OFFSHORE LIFT CAPACITY")
     ax.grid(True, which="both", linestyle="-", linewidth=0.5, alpha=0.6)
     ax.legend(title="Duty / Cdyn", loc="best")
-
-    # Show Cdyn caption if just one Duty
-    if len(selected_duties) == 1:
-        cd = duty_to_cdyn(selected_duties[0])
-        if cd is not None:
-            st.caption(f"DESIGN DYNAMIC FACTOR: {cd:.2f}")
+    cd = duty_to_cdyn(duty)
+    if cd is not None:
+        st.caption(f"DESIGN DYNAMIC FACTOR: {cd:.2f}")
 
     st.pyplot(fig, clear_figure=True)
 
-    # Download envelope for single selection
-    if len(selected_duties) == 1 and last_env is not None and not last_env.empty:
-        env_csv = last_env.rename(columns={"Outreach_bin": "Radius_m", "SWL_t": "SWL_t"})
-        csv_bytes = env_csv.to_csv(index=False).encode("utf-8")
-        st.download_button("Download SWL envelope (CSV)", data=csv_bytes,
-                           file_name="swl_envelope.csv", mime="text/csv")
+    # Download
+    env_csv = env.rename(columns={"Outreach_bin": "Radius_m", "SWL_t": "SWL_t"})
+    st.download_button(
+        "Download SWL envelope (CSV)",
+        data=env_csv.to_csv(index=False).encode("utf-8"),
+        file_name="swl_envelope_fixed_fj.csv",
+        mime="text/csv"
+    )
