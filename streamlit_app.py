@@ -225,73 +225,88 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("SWL Envelope (by Cdyn) — SWL [t] vs RADIUS [m]")
 
-    # Map Duty -> Cdyn (e.g., Harbour_Cd115 -> 1.15)
+    import re
     def duty_to_cdyn(d):
         m = re.search(r"Cd\s*([0-9]+)", d, flags=re.IGNORECASE)
-        if not m:
-            return None
-        return float(m.group(1)) / 100.0
+        return (float(m.group(1)) / 100.0) if m else None
 
-    # All duties available in data
-    all_duties = sorted(df["Duty"].unique().tolist())
-    duty_cdyn_pairs = [(d, duty_to_cdyn(d)) for d in all_duties]
-    # allow multi-select to compare
-    selected_duties = st.multiselect("Select Cdyn/Duties to plot",
-                                     all_duties,
-                                     default=[duty] if duty in all_duties else all_duties[:1])
+    # Select duties to plot (compare curves)
+    all_duties = sorted(df["Duty"].dropna().unique().tolist())
+    selected_duties = st.multiselect(
+        "Select Duty / Cdyn to plot",
+        all_duties,
+        default=[duty] if duty in all_duties else all_duties[:1]
+    )
 
-    # style options
-    col1, col2 = st.columns([1,1])
-    with col1:
+    col_a, col_b, col_c = st.columns([1,1,1])
+    with col_a:
+        # Bin size for smoothing the x-axis (radius). 0.5–1.0 m gives clean curves.
+        bin_step = st.number_input("Radius bin size (m)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+    with col_b:
         fill_under = st.checkbox("Fill under curve", value=False)
-    with col2:
+    with col_c:
         thick_line = st.checkbox("Use thick line style", value=True)
+
+    def bin_outreach(values, step):
+        # bin to multiples of step (e.g., 0.5 m): round(x/step)*step
+        return (np.round(values / step) * step).astype(float)
 
     if len(selected_duties) == 0:
         st.info("Select at least one Duty to plot.")
-    else:
-        fig, ax = plt.subplots(figsize=(9, 5.5))
+        st.stop()
 
-        for dsel in selected_duties:
-            w = df[df["Duty"] == dsel].copy()
-            if sel_fj:
-                w = w[w["FoldingJib_deg"].isin(sel_fj)]
-            if sel_mj:
-                w = w[w["MainJib_deg"].isin(sel_mj)]
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    last_env = None  # for download when a single duty is selected
 
-            if w.empty:
-                continue
+    for dsel in selected_duties:
+        w = df[df["Duty"] == dsel].copy()
+        if sel_fj:
+            w = w[w["FoldingJib_deg"].isin(sel_fj)]
+        if sel_mj:
+            w = w[w["MainJib_deg"].isin(sel_mj)]
+        if w.empty:
+            continue
 
-            # Envelope: for each outreach, take the maximum capacity across all heights / angles
-            env = (w.groupby("Outreach_m", as_index=False)
-                    .agg(SWL_t=("Capacity_t", "max"))
-                    .sort_values("Outreach_m"))
+        # 1) Bin/round outreach to reduce near-duplicate x-points
+        w["Outreach_bin"] = bin_outreach(w["Outreach_m"], bin_step)
 
-            # Plot
-            lw = 3.0 if thick_line else 1.5
-            line, = ax.plot(env["Outreach_m"], env["SWL_t"], linewidth=lw, label=dsel)
-            if fill_under:
-                ax.fill_between(env["Outreach_m"], env["SWL_t"], step=None, alpha=0.15)
+        # 2) Envelope per bin: take MAX capacity per radius bin
+        env = (w.groupby("Outreach_bin", as_index=False)
+                 .agg(SWL_t=("Capacity_t", "max"))
+                 .sort_values("Outreach_bin"))
 
-        # Labels / grid styled to resemble the sample
-        ax.set_xlabel("RADIUS [m]")
-        ax.set_ylabel("SWL [t]")
-        ax.grid(True, which="both", linestyle="-", linewidth=0.5, alpha=0.6)
-        ax.set_title("OFFSHORE LIFT CAPACITY")
+        # 3) Enforce monotonic non-increasing SWL vs radius (physical behavior)
+        env["SWL_t"] = env["SWL_t"].cummin()
 
-        # If a single duty is selected and has a Cdyn, show it like the sample subtitle
-        if len(selected_duties) == 1:
-            cd = duty_to_cdyn(selected_duties[0])
-            if cd is not None:
-                st.caption(f"DESIGN DYNAMIC FACTOR: {cd:.2f}")
+        # Optional: drop leading NaNs / tiny bins with no data (shouldn't occur after groupby)
+        env = env.dropna(subset=["Outreach_bin", "SWL_t"])
 
-        ax.legend(title="Duty / Cdyn", loc="best")
-        st.pyplot(fig, clear_figure=True)
+        # Plot
+        lw = 3.0 if thick_line else 1.5
+        ax.plot(env["Outreach_bin"], env["SWL_t"], linewidth=lw, label=dsel)
+        if fill_under:
+            ax.fill_between(env["Outreach_bin"], env["SWL_t"], step=None, alpha=0.15)
 
-        # Offer download of the last plotted envelope if only one duty is selected
-        if len(selected_duties) == 1 and not w.empty:
-            env_csv = env.rename(columns={"SWL_t": "SWL_t_at_envelope"})
-            csv_bytes = env_csv.to_csv(index=False).encode("utf-8")
-            st.download_button("Download SWL envelope (CSV)", data=csv_bytes,
-                               file_name="swl_envelope.csv", mime="text/csv")
+        last_env = env  # keep last for download if single selection
 
+    # Styling to match your reference
+    ax.set_xlabel("RADIUS [m]")
+    ax.set_ylabel("SWL [t]")
+    ax.set_title("OFFSHORE LIFT CAPACITY")
+    ax.grid(True, which="both", linestyle="-", linewidth=0.5, alpha=0.6)
+    ax.legend(title="Duty / Cdyn", loc="best")
+
+    # Show Cdyn caption if just one Duty
+    if len(selected_duties) == 1:
+        cd = duty_to_cdyn(selected_duties[0])
+        if cd is not None:
+            st.caption(f"DESIGN DYNAMIC FACTOR: {cd:.2f}")
+
+    st.pyplot(fig, clear_figure=True)
+
+    # Download envelope for single selection
+    if len(selected_duties) == 1 and last_env is not None and not last_env.empty:
+        env_csv = last_env.rename(columns={"Outreach_bin": "Radius_m", "SWL_t": "SWL_t"})
+        csv_bytes = env_csv.to_csv(index=False).encode("utf-8")
+        st.download_button("Download SWL envelope (CSV)", data=csv_bytes,
+                           file_name="swl_envelope.csv", mime="text/csv")
