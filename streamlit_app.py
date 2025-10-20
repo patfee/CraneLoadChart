@@ -463,20 +463,24 @@ with tab_outreach_load:
         )
 
 # ==========================================================
-# TAB 6 – Optimal FJ curve (interp toggle) — NEW
+# TAB 6 – Optimal FJ curve (interp toggle)  — with ordering & envelope toggles
 # ==========================================================
 with tab_optimal_curve:
     st.subheader("Optimal Folding Jib per Main Jib — Load vs Outreach")
 
-    # Select Duties (Cdyn)
     all_duties = sorted(df["Duty"].dropna().unique().tolist())
     duties_sel = st.multiselect(
         "Select Duty (Cdyn) to plot",
         all_duties,
-        default=[duty] if duty in all_duties else (all_duties[:1] if all_duties else [])
+        default=[duty] if duty in all_duties else (all_duties[:1] if all_duties else []),
+        key="t6_duties_sel"
     )
 
-    use_sidebar_filters = st.checkbox("Apply current FoldingJib/MainJib filters", value=False)
+    use_sidebar_filters = st.checkbox(
+        "Apply current FoldingJib/MainJib filters",
+        value=False,
+        key="t6_use_filters"
+    )
 
     st.markdown("**Interpolation mode (PCHIP):**")
     interp_mode = st.radio(
@@ -488,14 +492,39 @@ with tab_optimal_curve:
             "Interpolate both (FJ optimum + MJ densify)",
         ],
         index=3,
-        horizontal=False
+        horizontal=False,
+        key="t6_interp_mode"
     )
 
     col_interp = st.columns(2)
     with col_interp[0]:
-        fj_step = st.slider("FoldingJib sampling step (deg) when interpolating FJ", 0.1, 5.0, 0.5, 0.1)
+        fj_step = st.slider(
+            "FoldingJib sampling step (deg) when interpolating FJ",
+            0.1, 5.0, 0.5, 0.1,
+            key="t6_fj_step"
+        )
     with col_interp[1]:
-        mj_step = st.slider("MainJib interpolation step (deg) when interpolating MJ", 0.1, 5.0, 0.5, 0.1)
+        mj_step = st.slider(
+            "MainJib interpolation step (deg) when interpolating MJ",
+            0.1, 5.0, 0.5, 0.1,
+            key="t6_mj_step"
+        )
+
+    st.divider()
+    st.markdown("**Plot behaviour**")
+    order_mode = st.radio(
+        "X-ordering",
+        ["Sort by Outreach (recommended)", "Sort by MainJib (booming order)"],
+        index=0, horizontal=True, key="t6_order_mode"
+    )
+    enforce_envelope = st.checkbox(
+        "Enforce monotonic capacity envelope (Load ↓ as Outreach ↑)",
+        value=True, key="t6_enforce_env"
+    )
+    R_bin_step = st.slider(
+        "Outreach bin size (m) for envelope",
+        0.05, 1.0, 0.25, 0.05, key="t6_r_bin_step"
+    )
 
     fig, ax = plt.subplots(figsize=(9.5, 5.6))
     last_plot_df = None
@@ -512,25 +541,25 @@ with tab_optimal_curve:
         if W.empty:
             continue
 
-        # 1) Build optimal per MainJib
+        # 1) Build optimal per MainJib (optionally interpolate across FJ at each MJ)
         rows = []
         for mj, g in W.groupby("MainJib_deg"):
             g = g.dropna(subset=["FoldingJib_deg","Outreach_m","Capacity_t"])
             if g.empty:
                 continue
 
-            if interp_mode in ["Interpolate FoldingJib only (per MainJib)", "Interpolate both (FJ optimum + MJ densify)"]:
-                # PCHIP along FJ at this MainJib
-                # Need at least 2 unique FJ points
+            if st.session_state["t6_interp_mode"] in [
+                "Interpolate FoldingJib only (per MainJib)",
+                "Interpolate both (FJ optimum + MJ densify)"
+            ]:
                 g_sorted = g.sort_values("FoldingJib_deg")
                 fj_arr = g_sorted["FoldingJib_deg"].to_numpy()
-                # guard: need strictly increasing x for PCHIP
                 fj_unique, uniq_idx = np.unique(fj_arr, return_index=True)
                 if fj_unique.size >= 2:
                     cap = g_sorted["Capacity_t"].to_numpy()[uniq_idx]
                     out = g_sorted["Outreach_m"].to_numpy()[uniq_idx]
                     fj_min, fj_max = float(fj_unique.min()), float(fj_unique.max())
-                    fj_grid = np.arange(fj_min, fj_max + 1e-9, fj_step)
+                    fj_grid = np.arange(fj_min, fj_max + 1e-9, st.session_state["t6_fj_step"])
 
                     f_cap = PchipInterpolator(fj_unique, cap)
                     f_out = PchipInterpolator(fj_unique, out)
@@ -546,7 +575,6 @@ with tab_optimal_curve:
                         "Load_t": float(cap_i[k])
                     })
                 else:
-                    # fallback to discrete max if not enough FJ points
                     gg = g.sort_values(["Capacity_t","Outreach_m"], ascending=[False, False]).iloc[0]
                     rows.append({
                         "MainJib_deg": float(mj),
@@ -555,7 +583,6 @@ with tab_optimal_curve:
                         "Load_t": float(gg["Capacity_t"])
                     })
             else:
-                # No FJ interpolation: pick discrete optimal FJ (max load, tie-break by outreach)
                 gg = g.sort_values(["Capacity_t","Outreach_m"], ascending=[False, False]).iloc[0]
                 rows.append({
                     "MainJib_deg": float(mj),
@@ -570,7 +597,10 @@ with tab_optimal_curve:
         curve = pd.DataFrame(rows).sort_values("MainJib_deg")
 
         # 2) Interpolate across MainJib if requested
-        if interp_mode in ["Interpolate MainJib only (densify curve)", "Interpolate both (FJ optimum + MJ densify)"] and len(curve) >= 2:
+        if st.session_state["t6_interp_mode"] in [
+            "Interpolate MainJib only (densify curve)",
+            "Interpolate both (FJ optimum + MJ densify)"
+        ] and len(curve) >= 2:
             mj = curve["MainJib_deg"].to_numpy()
             o  = curve["Outreach_m"].to_numpy()
             l  = curve["Load_t"].to_numpy()
@@ -578,7 +608,7 @@ with tab_optimal_curve:
             f_o = PchipInterpolator(mj, o)
             f_l = PchipInterpolator(mj, l)
 
-            mj_i = np.arange(mj.min(), mj.max() + 1e-9, mj_step)
+            mj_i = np.arange(mj.min(), mj.max() + 1e-9, st.session_state["t6_mj_step"])
             o_i  = f_o(mj_i)
             l_i  = f_l(mj_i)
 
@@ -590,14 +620,33 @@ with tab_optimal_curve:
         else:
             curve_plot = curve
 
-        label_txt = f"{dname} — Optimal FJ per MJ" + (
-            " (FJ interp)" if "FoldingJib" in interp_mode else ""
-        ) + (
-            " + MJ interp" if "MainJib" in interp_mode else ""
-        )
-        ax.plot(curve_plot["Outreach_m"], curve_plot["Load_t"], linewidth=2.5, label=label_txt)
+        # ---------- NEW: Ordering & Envelope cleanup ----------
+        cp = curve_plot.copy()
 
-        last_plot_df = curve_plot.copy()
+        # Order X
+        if order_mode.startswith("Sort by Outreach"):
+            cp = cp.sort_values("Outreach_m", kind="mergesort")
+        else:
+            cp = cp.sort_values("MainJib_deg", kind="mergesort")
+
+        # Envelope (optional)
+        if enforce_envelope:
+            cp["R_bin"] = (np.round(cp["Outreach_m"] / st.session_state["t6_r_bin_step"]) * st.session_state["t6_r_bin_step"]).astype(float)
+            env = (cp.groupby("R_bin", as_index=False)
+                     .agg(Outreach_m=("Outreach_m", "mean"),
+                          Load_t=("Load_t", "max"))
+                     .sort_values("R_bin"))
+            env["Load_t"] = env["Load_t"].cummin()
+            cp = env[["Outreach_m", "Load_t"]]
+
+        label_txt = f"{dname} — Optimal FJ per MJ" + (
+            " (FJ interp)" if "FoldingJib" in st.session_state["t6_interp_mode"] else ""
+        ) + (
+            " + MJ interp" if "MainJib" in st.session_state["t6_interp_mode"] else ""
+        )
+        ax.plot(cp["Outreach_m"], cp["Load_t"], linewidth=2.5, label=label_txt)
+
+        last_plot_df = cp.copy()
         last_label = label_txt.replace(" ", "_")
 
     ax.set_xlabel("Outreach (m)")
@@ -615,5 +664,6 @@ with tab_optimal_curve:
             "Download plotted curve (CSV)",
             data=last_plot_df.to_csv(index=False).encode("utf-8"),
             file_name=f"optimal_fj_curve_{last_label}.csv",
-            mime="text/csv"
+            mime="text/csv",
+            key="t6_dl"
         )
