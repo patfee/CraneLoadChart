@@ -464,7 +464,7 @@ with tab_outreach_load:
 
 # ==========================================================
 # TAB 6 – Optimal FJ curve (interp toggle) — with ordering, envelope,
-#          and straight-line Outreach–Load comparison
+#          straight-line comparison, and Simultaneous MJ+FJ path
 # ==========================================================
 with tab_optimal_curve:
     st.subheader("Optimal Folding Jib per Main Jib — Load vs Outreach")
@@ -539,17 +539,25 @@ with tab_optimal_curve:
         0.05, 1.0, 0.25, 0.05, key="t6_straight_step"
     )
 
+    st.divider()
+    st.markdown("**Simultaneous MJ + FJ interpolation path** (continuous motion across (MJ,FJ))")
+    show_mjfj_path = st.checkbox(
+        "Overlay coordinated Main-Jib + Folding-Jib path",
+        value=True, key="t6_show_path"
+    )
+    n_path_pts = st.slider(
+        "Path samples",
+        10, 200, 60, 5, key="t6_path_n"
+    )
+
     fig, ax = plt.subplots(figsize=(9.5, 5.6))
     last_plot_df = None
     last_label = None
 
     # ---------- helpers ----------
     def build_optimal_curve_for_duty(W: pd.DataFrame) -> pd.DataFrame:
-        """
-        Build 'optimal FJ per MJ' curve (possibly with PCHIP over FJ and/or MJ).
-        Returns DataFrame with columns: MainJib_deg, FoldingJib_deg, Outreach_m, Load_t
-        """
-        # 1) optimal per MJ (maybe interp over FJ)
+        """Return DF(MainJib_deg,FoldingJib_deg,Outreach_m,Load_t) with optimal FJ per MJ.
+           Applies FJ and/or MJ PCHIP if selected."""
         rows = []
         for mj, g in W.groupby("MainJib_deg"):
             g = g.dropna(subset=["FoldingJib_deg","Outreach_m","Capacity_t"])
@@ -603,7 +611,7 @@ with tab_optimal_curve:
 
         curve = pd.DataFrame(rows).sort_values("MainJib_deg")
 
-        # 2) PCHIP across MJ if selected
+        # PCHIP across MJ if selected
         if st.session_state["t6_interp_mode"] in [
             "Interpolate MainJib only (densify curve)",
             "Interpolate both (FJ optimum + MJ densify)"
@@ -636,7 +644,7 @@ with tab_optimal_curve:
         return env[["Outreach_m","Load_t"]]
 
     def straight_line_curve(df_in: pd.DataFrame) -> pd.DataFrame:
-        """Make a straight-line (piecewise linear) curve in R–L space."""
+        """Piecewise linear curve in R–L space."""
         cp = order_curve(df_in)
         if len(cp) < 2:
             return cp[["Outreach_m","Load_t"]]
@@ -674,6 +682,53 @@ with tab_optimal_curve:
         if enforce_envelope:
             sl = enforce_capacity_envelope(sl)
 
+        # ---- NEW: Coordinated MJ+FJ path over the raw (MJ,FJ) surface ----
+        if show_mjfj_path:
+            # Interpolators from scattered data (no need for full rectangular grid)
+            pts = W[["MainJib_deg","FoldingJib_deg"]].to_numpy()
+            load_vals = W["Capacity_t"].to_numpy()
+            rad_vals  = W["Outreach_m"].to_numpy()
+            f_load2d = LinearNDInterpolator(pts, load_vals)
+            f_rad2d  = LinearNDInterpolator(pts, rad_vals)
+
+            # Use endpoints from the non-interpolated optimal curve (preserves real MJ values)
+            opt_per_mj = (W.groupby("MainJib_deg")
+                            .apply(lambda g: g.loc[g["Capacity_t"].idxmax()][["FoldingJib_deg","Outreach_m","Capacity_t"]])
+                            .reset_index()
+                         )
+            mj_min, mj_max = opt_per_mj["MainJib_deg"].min(), opt_per_mj["MainJib_deg"].max()
+            # Pick two endpoints via sliders
+            st.markdown("**MJ+FJ Path Endpoints**")
+            c1, c2 = st.columns(2)
+            with c1:
+                mj_start = st.slider("Start MainJib (deg)", float(mj_min), float(mj_max), float(mj_min), 0.01, key="t6_path_mj_start")
+            with c2:
+                mj_end   = st.slider("End MainJib (deg)",   float(mj_min), float(mj_max), float(mj_max), 0.01, key="t6_path_mj_end")
+
+            # Find optimal FJ at those MJ (discrete; we interpolate FJ linearly between them)
+            def best_fj_at(mj_val: float) -> float:
+                # nearest MJ group
+                row = opt_per_mj.iloc[(opt_per_mj["MainJib_deg"] - mj_val).abs().argmin()]
+                return float(row["FoldingJib_deg"])
+
+            fj_start = best_fj_at(mj_start)
+            fj_end   = best_fj_at(mj_end)
+
+            tt = np.linspace(0, 1, st.session_state["t6_path_n"])
+            MJp = mj_start + tt * (mj_end - mj_start)
+            FJp = fj_start + tt * (fj_end - fj_start)
+
+            path_load = f_load2d(np.column_stack([MJp, FJp]))
+            path_R    = f_rad2d (np.column_stack([MJp, FJp]))
+
+            path_df = pd.DataFrame({"MainJib_deg": MJp, "FoldingJib_deg": FJp,
+                                    "Outreach_m": path_R, "Load_t": path_load}).dropna()
+
+            # Order / enforce envelope to match the current display settings
+            path_show = order_curve(path_df)[["Outreach_m","Load_t"]]
+            if enforce_envelope and len(path_show):
+                path_show = enforce_capacity_envelope(path_show)
+
         # Plot according to display mode
         if display_mode == "Original only":
             ax.plot(orig["Outreach_m"], orig["Load_t"], linewidth=2.8, label=f"{dname} — Original")
@@ -692,6 +747,16 @@ with tab_optimal_curve:
             ], ignore_index=True)
             last_plot_df = both
             last_label = f"{dname}_Both"
+
+        # Overlay the coordinated MJ+FJ path
+        if show_mjfj_path and 'path_show' in locals() and len(path_show):
+            ax.plot(path_show["Outreach_m"], path_show["Load_t"], linewidth=2.2, linestyle=":", label=f"{dname} — MJ+FJ path")
+            # append to download
+            if last_plot_df is not None:
+                last_plot_df = pd.concat([last_plot_df, path_show.assign(Variant="MJ+FJ path")], ignore_index=True)
+            else:
+                last_plot_df = path_show.assign(Variant="MJ+FJ path")
+            last_label = f"{last_label}_withPath" if last_label else f"{dname}_PathOnly"
 
     ax.set_xlabel("Outreach (m)")
     ax.set_ylabel("Load (t)")
