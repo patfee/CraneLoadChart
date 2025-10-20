@@ -5,6 +5,8 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
+from scipy.interpolate import PchipInterpolator, LinearNDInterpolator
+
 from pathlib import Path
 from scipy.interpolate import PchipInterpolator  # Monotonic cubic spline
 
