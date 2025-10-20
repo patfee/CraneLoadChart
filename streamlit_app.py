@@ -463,7 +463,8 @@ with tab_outreach_load:
         )
 
 # ==========================================================
-# TAB 6 – Optimal FJ curve (interp toggle)  — with ordering & envelope toggles
+# TAB 6 – Optimal FJ curve (interp toggle) — with ordering, envelope,
+#          and straight-line Outreach–Load comparison
 # ==========================================================
 with tab_optimal_curve:
     st.subheader("Optimal Folding Jib per Main Jib — Load vs Outreach")
@@ -482,7 +483,7 @@ with tab_optimal_curve:
         key="t6_use_filters"
     )
 
-    st.markdown("**Interpolation mode (PCHIP):**")
+    st.markdown("**Interpolation mode for picking optimal points (PCHIP):**")
     interp_mode = st.radio(
         "Choose how to interpolate",
         [
@@ -526,22 +527,29 @@ with tab_optimal_curve:
         0.05, 1.0, 0.25, 0.05, key="t6_r_bin_step"
     )
 
+    st.divider()
+    st.markdown("**Straight-line comparison in Outreach–Load space**")
+    display_mode = st.radio(
+        "What to show",
+        ["Original only", "Straight-line only", "Both (overlay)"],
+        index=2, horizontal=True, key="t6_display_mode"
+    )
+    straight_step = st.slider(
+        "Outreach step (m) for straight-line curve",
+        0.05, 1.0, 0.25, 0.05, key="t6_straight_step"
+    )
+
     fig, ax = plt.subplots(figsize=(9.5, 5.6))
     last_plot_df = None
     last_label = None
 
-    for dname in duties_sel:
-        W = df[df["Duty"] == dname].copy()
-        if use_sidebar_filters:
-            if sel_fj:
-                W = W[W["FoldingJib_deg"].isin(sel_fj)]
-            if sel_mj:
-                W = W[W["MainJib_deg"].isin(sel_mj)]
-        W = W.dropna(subset=["MainJib_deg", "FoldingJib_deg", "Outreach_m", "Capacity_t"])
-        if W.empty:
-            continue
-
-        # 1) Build optimal per MainJib (optionally interpolate across FJ at each MJ)
+    # ---------- helpers ----------
+    def build_optimal_curve_for_duty(W: pd.DataFrame) -> pd.DataFrame:
+        """
+        Build 'optimal FJ per MJ' curve (possibly with PCHIP over FJ and/or MJ).
+        Returns DataFrame with columns: MainJib_deg, FoldingJib_deg, Outreach_m, Load_t
+        """
+        # 1) optimal per MJ (maybe interp over FJ)
         rows = []
         for mj, g in W.groupby("MainJib_deg"):
             g = g.dropna(subset=["FoldingJib_deg","Outreach_m","Capacity_t"])
@@ -566,7 +574,6 @@ with tab_optimal_curve:
 
                     cap_i = f_cap(fj_grid)
                     out_i = f_out(fj_grid)
-
                     k = int(np.argmax(cap_i))
                     rows.append({
                         "MainJib_deg": float(mj),
@@ -592,11 +599,11 @@ with tab_optimal_curve:
                 })
 
         if not rows:
-            continue
+            return pd.DataFrame(columns=["MainJib_deg","FoldingJib_deg","Outreach_m","Load_t"])
 
         curve = pd.DataFrame(rows).sort_values("MainJib_deg")
 
-        # 2) Interpolate across MainJib if requested
+        # 2) PCHIP across MJ if selected
         if st.session_state["t6_interp_mode"] in [
             "Interpolate MainJib only (densify curve)",
             "Interpolate both (FJ optimum + MJ densify)"
@@ -604,50 +611,87 @@ with tab_optimal_curve:
             mj = curve["MainJib_deg"].to_numpy()
             o  = curve["Outreach_m"].to_numpy()
             l  = curve["Load_t"].to_numpy()
-
             f_o = PchipInterpolator(mj, o)
             f_l = PchipInterpolator(mj, l)
-
             mj_i = np.arange(mj.min(), mj.max() + 1e-9, st.session_state["t6_mj_step"])
             o_i  = f_o(mj_i)
             l_i  = f_l(mj_i)
+            curve = pd.DataFrame({"MainJib_deg": mj_i, "Outreach_m": o_i, "Load_t": l_i})
 
-            curve_plot = pd.DataFrame({
-                "MainJib_deg": mj_i,
-                "Outreach_m": o_i,
-                "Load_t": l_i
-            })
-        else:
-            curve_plot = curve
+        return curve
 
-        # ---------- NEW: Ordering & Envelope cleanup ----------
-        cp = curve_plot.copy()
-
-        # Order X
+    def order_curve(df_in: pd.DataFrame) -> pd.DataFrame:
         if order_mode.startswith("Sort by Outreach"):
-            cp = cp.sort_values("Outreach_m", kind="mergesort")
-        else:
-            cp = cp.sort_values("MainJib_deg", kind="mergesort")
+            return df_in.sort_values("Outreach_m", kind="mergesort")
+        return df_in.sort_values("MainJib_deg", kind="mergesort")
 
-        # Envelope (optional)
+    def enforce_capacity_envelope(df_in: pd.DataFrame) -> pd.DataFrame:
+        cp = df_in.copy()
+        cp["R_bin"] = (np.round(cp["Outreach_m"] / st.session_state["t6_r_bin_step"]) * st.session_state["t6_r_bin_step"]).astype(float)
+        env = (cp.groupby("R_bin", as_index=False)
+                 .agg(Outreach_m=("Outreach_m","mean"),
+                      Load_t=("Load_t","max"))
+                 .sort_values("R_bin"))
+        env["Load_t"] = env["Load_t"].cummin()
+        return env[["Outreach_m","Load_t"]]
+
+    def straight_line_curve(df_in: pd.DataFrame) -> pd.DataFrame:
+        """Make a straight-line (piecewise linear) curve in R–L space."""
+        cp = order_curve(df_in)
+        if len(cp) < 2:
+            return cp[["Outreach_m","Load_t"]]
+        x = cp["Outreach_m"].to_numpy()
+        y = cp["Load_t"].to_numpy()
+        xu, uniq_idx = np.unique(x, return_index=True)
+        yu = y[uniq_idx]
+        x_grid = np.arange(xu.min(), xu.max() + 1e-9, st.session_state["t6_straight_step"])
+        y_grid = np.interp(x_grid, xu, yu)
+        return pd.DataFrame({"Outreach_m": x_grid, "Load_t": y_grid})
+
+    # ---------- loop per duty ----------
+    for dname in duties_sel:
+        W = df[df["Duty"] == dname].copy()
+        if use_sidebar_filters:
+            if sel_fj:
+                W = W[W["FoldingJib_deg"].isin(sel_fj)]
+            if sel_mj:
+                W = W[W["MainJib_deg"].isin(sel_mj)]
+        W = W.dropna(subset=["MainJib_deg","FoldingJib_deg","Outreach_m","Capacity_t"])
+        if W.empty:
+            continue
+
+        base_curve = build_optimal_curve_for_duty(W)
+        if base_curve.empty:
+            continue
+
+        # Original (ordered + optional envelope)
+        orig = order_curve(base_curve)[["Outreach_m","Load_t"]]
         if enforce_envelope:
-            cp["R_bin"] = (np.round(cp["Outreach_m"] / st.session_state["t6_r_bin_step"]) * st.session_state["t6_r_bin_step"]).astype(float)
-            env = (cp.groupby("R_bin", as_index=False)
-                     .agg(Outreach_m=("Outreach_m", "mean"),
-                          Load_t=("Load_t", "max"))
-                     .sort_values("R_bin"))
-            env["Load_t"] = env["Load_t"].cummin()
-            cp = env[["Outreach_m", "Load_t"]]
+            orig = enforce_capacity_envelope(orig)
 
-        label_txt = f"{dname} — Optimal FJ per MJ" + (
-            " (FJ interp)" if "FoldingJib" in st.session_state["t6_interp_mode"] else ""
-        ) + (
-            " + MJ interp" if "MainJib" in st.session_state["t6_interp_mode"] else ""
-        )
-        ax.plot(cp["Outreach_m"], cp["Load_t"], linewidth=2.5, label=label_txt)
+        # Straight-line variant (and optional envelope)
+        sl = straight_line_curve(base_curve)
+        if enforce_envelope:
+            sl = enforce_capacity_envelope(sl)
 
-        last_plot_df = cp.copy()
-        last_label = label_txt.replace(" ", "_")
+        # Plot according to display mode
+        if display_mode == "Original only":
+            ax.plot(orig["Outreach_m"], orig["Load_t"], linewidth=2.8, label=f"{dname} — Original")
+            last_plot_df = orig.copy(); last_plot_df["Variant"] = "Original"
+            last_label = f"{dname}_Original"
+        elif display_mode == "Straight-line only":
+            ax.plot(sl["Outreach_m"], sl["Load_t"], linewidth=2.8, linestyle="--", label=f"{dname} — Straight-line")
+            last_plot_df = sl.copy(); last_plot_df["Variant"] = "Straight-line"
+            last_label = f"{dname}_StraightLine"
+        else:  # Both (overlay)
+            ax.plot(orig["Outreach_m"], orig["Load_t"], linewidth=2.8, label=f"{dname} — Original")
+            ax.plot(sl["Outreach_m"], sl["Load_t"], linewidth=2.5, linestyle="--", label=f"{dname} — Straight-line")
+            both = pd.concat([
+                orig.assign(Variant="Original"),
+                sl.assign(Variant="Straight-line")
+            ], ignore_index=True)
+            last_plot_df = both
+            last_label = f"{dname}_Both"
 
     ax.set_xlabel("Outreach (m)")
     ax.set_ylabel("Load (t)")
