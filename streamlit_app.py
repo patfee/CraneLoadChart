@@ -122,7 +122,7 @@ with tabs[1]:
         st.warning("No data after filters.")
         st.stop()
 
-    # If multiple points exist for the same (Outreach, Height), aggregate by max capacity (or user-chosen)
+    # If multiple points exist for the same (Outreach, Height), aggregate by chosen statistic
     agg_mode = grid_right.selectbox("Aggregate duplicates by", ["max", "min", "mean"], index=0)
     agg_df = filt.groupby(["Outreach_m","Height_m"], as_index=False).agg(Capacity_t=("Capacity_t", agg_mode))
 
@@ -144,11 +144,11 @@ with tabs[1]:
     XI, YI = np.meshgrid(xi, yi)
     ZI = interpolator(XI, YI)
 
-    # Levels control
+    # Levels & threshold controls
     with grid_right:
         zmin = float(np.nanmin(z))
         zmax = float(np.nanmax(z))
-        st.caption(f"Capacity range in data: {zmin:.2f} – {zmax:.2f} (t)")
+        st.caption(f"Capacity range in data: {zmin:.2f} – {zmax:.2f} t")
 
         levels_mode = st.radio("Levels", ["Auto", "N levels", "Custom list"], index=0, horizontal=True)
         filled = st.checkbox("Filled contours", value=True)
@@ -169,17 +169,41 @@ with tabs[1]:
                 st.warning("Could not parse custom levels; using auto.")
                 levels = None
 
+        st.markdown("**Iso-load threshold**")
+        thresh = st.number_input("Threshold (t): plot isoline at this load, and optionally shade region ≥ threshold", min_value=0.0, value=50.0, step=1.0)
+        shade_region = st.checkbox("Shade region ≥ threshold", value=True)
+        draw_isoline = st.checkbox("Draw isoline at threshold", value=True)
+
     # Plot
     fig, ax = plt.subplots(figsize=(8, 6))
-    # mask invalid areas
     Zmask = np.ma.array(ZI, mask=np.isnan(ZI))
 
+    # Base contour plot
     if filled:
         cs = ax.contourf(XI, YI, Zmask, levels=levels)
+        cbar = fig.colorbar(cs, ax=ax)
+        cbar.set_label("Capacity (t)")
     else:
         cs = ax.contour(XI, YI, Zmask, levels=levels)
-    cbar = fig.colorbar(cs, ax=ax)
-    cbar.set_label("Capacity (t)")
+        cbar = fig.colorbar(cs, ax=ax)
+        cbar.set_label("Capacity (t)")
+
+    # Threshold shading (region ≥ threshold)
+    if shade_region and np.isfinite(zmax):
+        # Two-level fill from threshold to max to shade the "safe" / higher-capacity region
+        try:
+            ax.contourf(XI, YI, Zmask, levels=[thresh, zmax], alpha=0.35)
+        except Exception:
+            pass  # in case thresh is outside data range
+
+    # Draw the exact isoline at the threshold
+    if draw_isoline:
+        try:
+            cs_th = ax.contour(XI, YI, Zmask, levels=[thresh], linewidths=2.0)
+            # label the isoline
+            ax.clabel(cs_th, fmt={thresh: f"{thresh:g} t"}, inline=True, fontsize=9)
+        except Exception:
+            pass
 
     if show_points:
         ax.plot(x, y, ".", ms=2)
@@ -201,4 +225,3 @@ with tabs[1]:
 
     with st.expander("Raw points used (after aggregation)"):
         st.dataframe(agg_df.sort_values(["Outreach_m","Height_m"]), use_container_width=True)
-
