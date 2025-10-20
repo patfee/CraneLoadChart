@@ -6,6 +6,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from pathlib import Path
+from scipy.interpolate import PchipInterpolator  # Monotonic cubic spline
 
 st.set_page_config(page_title="Crane Capacity Viewer", layout="wide")
 
@@ -60,11 +61,12 @@ with st.sidebar:
     sel_mj = st.multiselect("MainJib_deg (optional)", mj_vals, default=mj_vals)
 
 # ---------------- Tabs ----------------
-tab_curve, tab_iso, tab_envelope, tab_diag = st.tabs([
+tab_curve, tab_iso, tab_envelope, tab_diag, tab_outreach_load = st.tabs([
     "Curve (Capacity vs Outreach)",
     "Iso-load Contour",
     "SWL Envelope (by Cdyn)",
-    "SWL vs MainJib (fixed FJ)"
+    "SWL vs MainJib (fixed FJ)",
+    "Outreach vs Load (booming modes)"
 ])
 
 # ==========================================================
@@ -224,6 +226,7 @@ with tab_envelope:
 
     if interpolate_grid and len(env)>=2:
         xi=np.arange(env["Outreach_bin"].min(), env["Outreach_bin"].max()+1e-9, bin_step)
+        # linear here is fine; we keep monotonic via cummin below
         yi=np.interp(xi, env["Outreach_bin"], env["SWL_t"])
         env=pd.DataFrame({"Outreach_bin":xi,"SWL_t":yi})
 
@@ -295,3 +298,156 @@ with tab_diag:
     st.download_button("Download table (CSV)",
                        data=grp.to_csv(index=False).encode("utf-8"),
                        file_name="swl_vs_mainjib_fixed_fj.csv")
+
+# ==========================================================
+# TAB 5 – Outreach vs Load (booming with Main Jib) + Monotonic cubic interpolation
+# ==========================================================
+with tab_outreach_load:
+    st.subheader("Outreach vs Load — booming with Main Jib")
+
+    # Select Duties (Cdyn)
+    all_duties = sorted(df["Duty"].dropna().unique().tolist())
+    duties_sel = st.multiselect(
+        "Select Duty (Cdyn) to plot",
+        all_duties,
+        default=[duty] if duty in all_duties else (all_duties[:1] if all_duties else [])
+    )
+
+    # Optional: honor sidebar filters
+    use_sidebar_filters = st.checkbox("Apply current FoldingJib/MainJib filters", value=False)
+
+    # Modes per your spec
+    mode = st.radio(
+        "Mode",
+        [
+            "A) Max load per MainJib (optimal FoldingJib for capacity)",
+            "B) Force FoldingJib to endpoints for clearance (0° = shortest, 102° = longest)"
+        ],
+        index=0,
+        horizontal=False
+    )
+
+    # Endpoint controls for Mode B
+    if mode.startswith("B)"):
+        endpoint_choice = st.radio(
+            "Endpoint path",
+            ["Shortest (FJ = 0°)", "Longest (FJ = 102°)"],
+            index=0,
+            horizontal=True
+        )
+        fj_target = 0.0 if endpoint_choice.startswith("Shortest") else 102.0
+        fj_tol = st.number_input(
+            "FoldingJib matching tolerance (deg)",
+            min_value=0.0, max_value=5.0, value=0.25, step=0.05,
+            help="At each MainJib, we pick rows whose FJ is nearest to the target (0° or 102°). "
+                 "If none within tolerance, we use the absolute nearest."
+        )
+
+    st.divider()
+    st.markdown("**Interpolation (monotonic cubic)** — densify between provided MainJib angles")
+    do_interp = st.checkbox("Interpolate between MainJib steps (PCHIP)", value=True)
+    interp_step = st.slider("Interpolation step (deg)", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
+
+    # --- Selection helpers ---
+    def pick_optimal_FJ_for_max_load(g: pd.DataFrame) -> pd.Series:
+        # Mode A: Max Capacity_t; tie-break by largest Outreach
+        return g.sort_values(["Capacity_t", "Outreach_m"], ascending=[False, False]).iloc[0]
+
+    def pick_nearest_endpoint_FJ_then_max_load(g: pd.DataFrame, target_fj: float, tol: float) -> pd.Series:
+        # Mode B: restrict to rows nearest to target FJ; choose max load; tie-break by largest Outreach
+        gg = g.copy()
+        gg["fj_err"] = (gg["FoldingJib_deg"] - target_fj).abs()
+        min_err = float(gg["fj_err"].min())
+        cand = gg[gg["fj_err"] <= max(min_err, tol)]
+        return cand.sort_values(["Capacity_t", "Outreach_m"], ascending=[False, False]).iloc[0]
+
+    fig, ax = plt.subplots(figsize=(9.5, 5.6))
+    last_df_for_download = None
+    last_label = None
+
+    for dname in duties_sel:
+        W = df[df["Duty"] == dname].copy()
+        if use_sidebar_filters:
+            if sel_fj:
+                W = W[W["FoldingJib_deg"].isin(sel_fj)]
+            if sel_mj:
+                W = W[W["MainJib_deg"].isin(sel_mj)]
+
+        W = W.dropna(subset=["MainJib_deg", "FoldingJib_deg", "Outreach_m", "Capacity_t"])
+        if W.empty:
+            continue
+
+        # Build the discrete curve first (one point per MainJib angle)
+        rows = []
+        for mj, g in W.groupby("MainJib_deg"):
+            g = g.dropna(subset=["Outreach_m", "Capacity_t"])
+            if g.empty:
+                continue
+            if mode.startswith("A)"):
+                row = pick_optimal_FJ_for_max_load(g)
+            else:
+                row = pick_nearest_endpoint_FJ_then_max_load(g, fj_target, fj_tol)
+
+            rows.append({
+                "MainJib_deg": float(mj),
+                "FoldingJib_deg": float(row["FoldingJib_deg"]),
+                "Outreach_m": float(row["Outreach_m"]),
+                "Load_t": float(row["Capacity_t"])
+            })
+
+        if not rows:
+            continue
+
+        curve = pd.DataFrame(rows).sort_values("MainJib_deg")
+
+        # --- Monotonic cubic interpolation over MainJib_deg (PCHIP) ---
+        # We interpolate Outreach(mj) and Load(mj) separately, then plot Load vs Outreach.
+        if do_interp and len(curve) >= 2:
+            mj = curve["MainJib_deg"].to_numpy()
+            o  = curve["Outreach_m"].to_numpy()
+            l  = curve["Load_t"].to_numpy()
+
+            # Build monotonic cubic splines
+            f_outreach = PchipInterpolator(mj, o)
+            f_load     = PchipInterpolator(mj, l)
+
+            mj_i = np.arange(mj.min(), mj.max() + 1e-9, interp_step)
+            o_i  = f_outreach(mj_i)
+            l_i  = f_load(mj_i)
+
+            curve_plot = pd.DataFrame({
+                "MainJib_deg": mj_i,
+                "Outreach_m": o_i,
+                "Load_t": l_i
+            })
+        else:
+            curve_plot = curve
+
+        # Plot x=Outreach, y=Load
+        label_txt = (f"{dname} – Mode A (optimal FJ)"
+                     if mode.startswith("A)")
+                     else f"{dname} – Mode B ({'FJ=0° shortest' if (mode.startswith('B)') and fj_target==0.0) else 'FJ=102° longest'})")
+        ax.plot(curve_plot["Outreach_m"], curve_plot["Load_t"], linewidth=2.5, label=label_txt)
+
+        # keep last set for download
+        last_df_for_download = curve_plot.copy()
+        last_label = label_txt.replace(" ", "_").replace("°","deg")
+
+    ax.set_xlabel("Outreach (m)")
+    ax.set_ylabel("Load (t)")
+    ax.grid(True, linestyle="-", linewidth=0.5, alpha=0.6)
+    ax.set_title("Outreach vs Load while booming Main Jib")
+    if duties_sel:
+        ax.legend(loc="best")
+    st.pyplot(fig, clear_figure=True)
+
+    # Show & download data that was plotted last
+    if last_df_for_download is not None:
+        st.subheader("Data points used for the last curve plotted")
+        st.dataframe(last_df_for_download, use_container_width=True)
+        st.download_button(
+            "Download plotted curve (CSV)",
+            data=last_df_for_download.to_csv(index=False).encode("utf-8"),
+            file_name=f"outreach_vs_load_{last_label}.csv",
+            mime="text/csv"
+        )
