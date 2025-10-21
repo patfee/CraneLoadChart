@@ -197,6 +197,30 @@ def main():
                                           fj_min, fj_max, default=(fj_min+fj_max)/2, step=0.01)
 
         ox, hz_raw, rated = nearest_point(df_env, fold_angle, main_angle)
+        # Find the exact nearest angles used (from current environment df)
+        try:
+            idx_env = ((df_env["FoldingJib"] - fold_angle).abs() + (df_env["MainJib"] - main_angle).abs()).idxmin()
+            nearest_main = float(df_env.loc[idx_env, "MainJib"])
+            nearest_fold = float(df_env.loc[idx_env, "FoldingJib"])
+        except Exception:
+            nearest_main, nearest_fold = np.nan, np.nan
+
+        # Max load at these angles across ALL conditions/environments
+        if np.isfinite(nearest_main) and np.isfinite(nearest_fold):
+            same_angles = df_all[(df_all["MainJib"] == nearest_main) & (df_all["FoldingJib"] == nearest_fold)]
+            if not same_angles.empty:
+                max_load_at_angles = float(same_angles["Load"].max())
+                # Identify which condition/environment yields that max (for info)
+                row_max = same_angles.loc[same_angles["Load"].idxmax()]
+                max_env_label = str(row_max.get("Environment", ""))
+                max_cond_label = str(row_max.get("Condition", ""))
+            else:
+                max_load_at_angles = np.nan
+                max_env_label = max_cond_label = ""
+        else:
+            max_load_at_angles = np.nan
+            max_env_label = max_cond_label = ""
+    
         daf = float(df_env["Cd"].iloc[0]) if "Cd" in df_env.columns and not df_env.empty else np.nan
 
         st.markdown("#### Height reference")
@@ -217,6 +241,11 @@ def main():
             st.header(f"{ox:.2f}" if np.isfinite(ox) else "-")
             st.text("Rated load [t]")
             st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
+            st.text("Max load @ angles [t]")
+            if np.isfinite(max_load_at_angles):
+                st.markdown(f"<h3>{max_load_at_angles:.1f}</h3><div style='font-size:0.85rem;color:#aaa'>({max_env_label} / {max_cond_label})</div>", unsafe_allow_html=True)
+            else:
+                st.header("-")
             st.text("Distance from hull [m]")
             if np.isfinite(dist_from_hull) and dist_from_hull < 0:
                 st.markdown(f"<h3 style='color:#cc0000'>{dist_from_hull:.2f}</h3>", unsafe_allow_html=True)
