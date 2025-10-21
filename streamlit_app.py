@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import pandas as pd
@@ -9,6 +8,7 @@ from matplotlib.tri import Triangulation, LinearTriInterpolator
 st.set_page_config(page_title="Crane Curve Viewer", layout="wide")
 
 DATA_PATH = "./data/CraneData_streamlit_long.csv"
+
 
 @st.cache_data
 def load_data(path: str) -> pd.DataFrame:
@@ -23,6 +23,7 @@ def load_data(path: str) -> pd.DataFrame:
     df["Environment"] = df["Environment"].astype("category")
     return df
 
+
 def nearest_point(df, fold_angle, main_angle):
     if df.empty:
         return np.nan, np.nan, np.nan
@@ -30,10 +31,9 @@ def nearest_point(df, fold_angle, main_angle):
     row = df.loc[idx]
     return float(row["Outreach"]), float(row["Height"]), float(row["Load"])
 
+
 def extract_iso_polyline(XI, YI, ZI, target):
-    \"\"\"Return a list of (x, y) points along the iso-load contour.
-    XI, YI are 2D meshgrids; ZI is same shape; target is load value.
-    \"\"\"
+    """Return a list of (x, y) points along the iso-load contour."""
     if XI is None or YI is None or ZI is None:
         return []
     try:
@@ -45,16 +45,17 @@ def extract_iso_polyline(XI, YI, ZI, target):
 
     pts = []
     if len(cs.allsegs) and len(cs.allsegs[0]):
-        # Take all segments and concatenate (keep order per segment)
         for seg in cs.allsegs[0]:
             for (xx, yy) in seg:
                 pts.append((float(xx), float(yy)))
-    # Deduplicate consecutive duplicates
+
+    # Remove duplicates
     dedup = []
     for p in pts:
         if not dedup or (abs(dedup[-1][0]-p[0])>1e-9 or abs(dedup[-1][1]-p[1])>1e-9):
             dedup.append(p)
     return dedup
+
 
 def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Rated capacity related to height and radius"):
     if df_env.empty:
@@ -86,7 +87,6 @@ def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Ra
             cs = ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
         except Exception:
             cs = None
-        # Also extract iso polyline points for later plotting / export
         iso_pts = extract_iso_polyline(XI, YI, ZI, target)
 
     if marker is not None and all(np.isfinite(marker)):
@@ -103,6 +103,7 @@ def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Ra
         cbar.set_label("Load [t]")
     return fig, XI, YI, ZI, iso_pts
 
+
 def capacity_envelope_vs_radius(df_env):
     if df_env.empty:
         return np.array([]), np.array([])
@@ -117,6 +118,7 @@ def capacity_envelope_vs_radius(df_env):
     order = np.argsort(xs)
     return xs[order], ys[order]
 
+
 def main():
     st.markdown("## DCN Picasso DSV Crane Curve Interface")
 
@@ -126,7 +128,6 @@ def main():
         st.error(f"Could not load data from {DATA_PATH}: {e}")
         st.stop()
 
-    # Environment selector
     env_options = ["Harbour", "Deck", "SeaSubsea", "Subsea"]
     chosen_env = st.radio("Environment", env_options, horizontal=True, index=0)
     df_env = df[df["Environment"] == chosen_env]
@@ -134,7 +135,6 @@ def main():
         st.warning(f"No rows found for environment: {chosen_env}")
         st.stop()
 
-    # Layout: Left plot, Right controls
     left, right = st.columns([2.2, 1.0])
 
     with right:
@@ -165,7 +165,6 @@ def main():
         target = st.slider("Iso-load [t] (overlay)", minL, maxL, iso_default, step=0.1)
 
     with left:
-        # --- Main contour chart with iso-overlay and RED current point ---
         fig, XI, YI, ZI, iso_pts = contour_plot(
             df_env,
             target=target,
@@ -175,7 +174,6 @@ def main():
         if fig is not None:
             st.pyplot(fig, use_container_width=True)
 
-        # --- Capacity curve (Print chart) ---
         st.markdown("### Print chart")
         xs, ys = capacity_envelope_vs_radius(df_env)
 
@@ -195,7 +193,6 @@ def main():
         else:
             st.info("No data available to build capacity curve for the selected environment.")
 
-        # --- New bottom chart: Iso-load polyline Radius vs Height ---
         st.markdown("### Iso-load profile (Radius vs Height)")
         if iso_pts:
             iso_df = pd.DataFrame(iso_pts, columns=["Radius_m","Height_m"]).sort_values("Radius_m")
@@ -213,6 +210,7 @@ def main():
                                mime="text/csv")
         else:
             st.info("Iso-load contour could not be extracted for this target. Try another value.")
+
 
 if __name__ == "__main__":
     main()
