@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import pandas as pd
@@ -55,7 +54,7 @@ def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True, title="R
     hm = ax.contourf(XI, YI, ZI, levels=20)
     if target is not None:
         try:
-            ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0, colors=['#34113F'])
+            ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
         except Exception:
             pass
 
@@ -78,18 +77,31 @@ def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True, title="R
 
 
 def capacity_envelope_vs_radius(df_env):
+    """
+    Build a clean capacity-vs-radius envelope from scattered (R, Load) samples:
+    1) Round radius to 2 decimals to coalesce near-duplicates.
+    2) Take max SWL at each rounded radius.
+    3) Sort by radius.
+    4) Enforce non-increasing SWL with radius (right-to-left running max)
+       to remove aliasing ripples from angle->radius sampling.
+    """
     if df_env.empty:
         return np.array([]), np.array([])
-    g = (
-        df_env
-        .groupby(pd.cut(df_env["Outreach"], bins=200, include_lowest=True))["Load"]
-        .max()
-        .dropna()
-    )
-    xs = np.array([float(iv.mid) for iv in g.index])
-    ys = g.values
-    order = np.argsort(xs)
-    return xs[order], ys[order]
+
+    r = df_env["Outreach"].to_numpy(dtype=float)
+    L = df_env["Load"].to_numpy(dtype=float)
+
+    r_round = np.round(r, 2)
+    agg = (pd.DataFrame({"r": r_round, "L": L})
+             .groupby("r", as_index=False)["L"].max()
+             .sort_values("r"))
+
+    xs = agg["r"].to_numpy()
+    ys = agg["L"].to_numpy()
+
+    # enforce monotone non-increasing envelope
+    ys = np.maximum.accumulate(ys[::-1])[::-1]
+    return xs, ys
 
 
 def synced_slider_number(label, key_base, min_val, max_val, default, step=0.01, fmt="%.2f"):
@@ -197,30 +209,6 @@ def main():
                                           fj_min, fj_max, default=(fj_min+fj_max)/2, step=0.01)
 
         ox, hz_raw, rated = nearest_point(df_env, fold_angle, main_angle)
-        # Find the exact nearest angles used (from current environment df)
-        try:
-            idx_env = ((df_env["FoldingJib"] - fold_angle).abs() + (df_env["MainJib"] - main_angle).abs()).idxmin()
-            nearest_main = float(df_env.loc[idx_env, "MainJib"])
-            nearest_fold = float(df_env.loc[idx_env, "FoldingJib"])
-        except Exception:
-            nearest_main, nearest_fold = np.nan, np.nan
-
-        # Max load at these angles across ALL conditions/environments
-        if np.isfinite(nearest_main) and np.isfinite(nearest_fold):
-            same_angles = df_all[(df_all["MainJib"] == nearest_main) & (df_all["FoldingJib"] == nearest_fold)]
-            if not same_angles.empty:
-                max_load_at_angles = float(same_angles["Load"].max())
-                # Identify which condition/environment yields that max (for info)
-                row_max = same_angles.loc[same_angles["Load"].idxmax()]
-                max_env_label = str(row_max.get("Environment", ""))
-                max_cond_label = str(row_max.get("Condition", ""))
-            else:
-                max_load_at_angles = np.nan
-                max_env_label = max_cond_label = ""
-        else:
-            max_load_at_angles = np.nan
-            max_env_label = max_cond_label = ""
-    
         daf = float(df_env["Cd"].iloc[0]) if "Cd" in df_env.columns and not df_env.empty else np.nan
 
         st.markdown("#### Height reference")
@@ -234,6 +222,28 @@ def main():
 
         # Distance from hull
         dist_from_hull = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
+
+        # Max load across all environments for these angles + labels
+        try:
+            idx_env = ((df_env["FoldingJib"] - fold_angle).abs() + (df_env["MainJib"] - main_angle).abs()).idxmin()
+            nearest_main = float(df_env.loc[idx_env, "MainJib"])
+            nearest_fold = float(df_env.loc[idx_env, "FoldingJib"])
+        except Exception:
+            nearest_main, nearest_fold = np.nan, np.nan
+
+        if np.isfinite(nearest_main) and np.isfinite(nearest_fold):
+            same_angles = df_all[(df_all["MainJib"] == nearest_main) & (df_all["FoldingJib"] == nearest_fold)]
+            if not same_angles.empty:
+                max_load_at_angles = float(same_angles["Load"].max())
+                row_max = same_angles.loc[same_angles["Load"].idxmax()]
+                max_env_label = str(row_max.get("Environment", ""))
+                max_cond_label = str(row_max.get("Condition", ""))
+            else:
+                max_load_at_angles = np.nan
+                max_env_label = max_cond_label = ""
+        else:
+            max_load_at_angles = np.nan
+            max_env_label = max_cond_label = ""
 
         k1, k2 = st.columns(2)
         with k1:
