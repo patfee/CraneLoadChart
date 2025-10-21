@@ -32,31 +32,6 @@ def nearest_point(df, fold_angle, main_angle):
     return float(row["Outreach"]), float(row["Height"]), float(row["Load"])
 
 
-def extract_iso_polyline(XI, YI, ZI, target):
-    """Return a list of (x, y) points along the iso-load contour."""
-    if XI is None or YI is None or ZI is None:
-        return []
-    try:
-        fig_tmp, ax_tmp = plt.subplots()
-        cs = ax_tmp.contour(XI, YI, ZI, levels=[target])
-        plt.close(fig_tmp)
-    except Exception:
-        return []
-
-    pts = []
-    if len(cs.allsegs) and len(cs.allsegs[0]):
-        for seg in cs.allsegs[0]:
-            for (xx, yy) in seg:
-                pts.append((float(xx), float(yy)))
-
-    # Remove duplicates
-    dedup = []
-    for p in pts:
-        if not dedup or (abs(dedup[-1][0]-p[0])>1e-9 or abs(dedup[-1][1]-p[1])>1e-9):
-            dedup.append(p)
-    return dedup
-
-
 def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Rated capacity related to height and radius"):
     if df_env.empty:
         st.warning("No data to plot for this environment/filters.")
@@ -65,7 +40,6 @@ def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Ra
     y = df_env["Height"].values
     z = df_env["Load"].values
 
-    # Ensure enough unique points for triangulation
     if len(np.unique(x)) < 3 or len(np.unique(y)) < 3:
         st.warning("Not enough unique (Outreach, Height) points to build contour.")
         return None, None, None, None
@@ -81,17 +55,14 @@ def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Ra
 
     fig, ax = plt.subplots(figsize=(8, 7))
     hm = ax.contourf(XI, YI, ZI, levels=20)
-    iso_pts = []
     if target is not None:
         try:
-            cs = ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
+            ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
         except Exception:
-            cs = None
-        iso_pts = extract_iso_polyline(XI, YI, ZI, target)
+            pass
 
     if marker is not None and all(np.isfinite(marker)):
         ox, hz = marker
-        # RED current point
         ax.plot([ox], [hz], marker="o", markersize=7, markerfacecolor="red", markeredgecolor="red")
 
     ax.set_xlabel("y Radius [m]")
@@ -101,7 +72,7 @@ def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Ra
     if show_colorbar:
         cbar = fig.colorbar(hm, ax=ax, shrink=0.9)
         cbar.set_label("Load [t]")
-    return fig, XI, YI, ZI, iso_pts
+    return fig, XI, YI, ZI
 
 
 def capacity_envelope_vs_radius(df_env):
@@ -117,6 +88,31 @@ def capacity_envelope_vs_radius(df_env):
     ys = g.values
     order = np.argsort(xs)
     return xs[order], ys[order]
+
+
+def synced_slider_number(label, key_base, min_val, max_val, default, step=0.01, fmt="%.2f"):
+    if key_base not in st.session_state:
+        st.session_state[key_base] = float(np.clip(default, min_val, max_val))
+        st.session_state[f"{key_base}_num"] = st.session_state[key_base]
+
+    def from_num():
+        v = float(st.session_state[f"{key_base}_num"])
+        v = float(np.clip(v, min_val, max_val))
+        st.session_state[key_base] = v
+
+    def from_sld():
+        v = float(st.session_state[key_base])
+        st.session_state[f"{key_base}_num"] = v
+
+    col_num, col_sld = st.columns([1, 3])
+    with col_num:
+        st.number_input(label, min_value=float(min_val), max_value=float(max_val),
+                        value=float(st.session_state[f"{key_base}_num"]), step=step,
+                        format=fmt, key=f"{key_base}_num", on_change=from_num)
+    with col_sld:
+        st.slider("", min_val, max_val, value=float(st.session_state[key_base]), step=step,
+                  key=key_base, on_change=from_sld)
+    return float(st.session_state[key_base])
 
 
 def main():
@@ -142,8 +138,10 @@ def main():
         mj_min, mj_max = float(df_env["MainJib"].min()), float(df_env["MainJib"].max())
         fj_min, fj_max = float(df_env["FoldingJib"].min()), float(df_env["FoldingJib"].max())
 
-        main_angle = st.slider("Main angle [deg]", mj_min, mj_max, float(np.round((mj_min+mj_max)/2,2)), step=0.01)
-        fold_angle = st.slider("Folding angle [deg]", fj_min, fj_max, float(np.round((fj_min+fj_max)/2,2)), step=0.01)
+        main_angle = synced_slider_number("Main angle [deg]", "main_angle",
+                                          mj_min, mj_max, default=(mj_min+mj_max)/2, step=0.01)
+        fold_angle = synced_slider_number("Folding angle [deg]", "fold_angle",
+                                          fj_min, fj_max, default=(fj_min+fj_max)/2, step=0.01)
 
         ox, hz, rated = nearest_point(df_env, fold_angle, main_angle)
         daf = float(df_env["Cd"].iloc[0]) if "Cd" in df_env.columns and not df_env.empty else np.nan
@@ -161,11 +159,11 @@ def main():
             st.header(f"{daf:.2f}" if np.isfinite(daf) else "-")
 
         minL, maxL = float(df_env["Load"].min()), float(df_env["Load"].max())
-        iso_default = float(np.round((minL + maxL)/2, 1))
-        target = st.slider("Iso-load [t] (overlay)", minL, maxL, iso_default, step=0.1)
+        target = synced_slider_number("Iso-load [t] (overlay)", "iso_load", minL, maxL,
+                                      default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
     with left:
-        fig, XI, YI, ZI, iso_pts = contour_plot(
+        fig, XI, YI, ZI = contour_plot(
             df_env,
             target=target,
             marker=(ox, hz),
@@ -192,24 +190,6 @@ def main():
                                file_name=f"capacity_curve_{chosen_env}.csv", mime="text/csv")
         else:
             st.info("No data available to build capacity curve for the selected environment.")
-
-        st.markdown("### Iso-load profile (Radius vs Height)")
-        if iso_pts:
-            iso_df = pd.DataFrame(iso_pts, columns=["Radius_m","Height_m"]).sort_values("Radius_m")
-            fig3, ax3 = plt.subplots(figsize=(8, 4.5))
-            ax3.plot(iso_df["Radius_m"], iso_df["Height_m"], linewidth=2.0)
-            ax3.set_xlabel("RADIUS (m)")
-            ax3.set_ylabel("HEIGHT (m)")
-            ax3.set_title(f"Iso-load polyline @ {target:.2f} t")
-            ax3.grid(True, alpha=0.3)
-            st.pyplot(fig3, use_container_width=True)
-
-            st.download_button("Download iso-load polyline CSV",
-                               iso_df.to_csv(index=False).encode("utf-8"),
-                               file_name=f"iso_polyline_{chosen_env}_{target:.2f}t.csv",
-                               mime="text/csv")
-        else:
-            st.info("Iso-load contour could not be extracted for this target. Try another value.")
 
 
 if __name__ == "__main__":
