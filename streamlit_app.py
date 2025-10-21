@@ -33,7 +33,9 @@ def nearest_point(df, fold_angle, main_angle):
     return float(row["Outreach"]), float(row["Height"]), float(row["Load"])
 
 
-def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True, title="Rated capacity related to height and radius"):
+def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True,
+                 title="Rated capacity related to height and radius",
+                 vmin=None, vmax=None, nlevels=20):
     if len(x) < 3 or len(y) < 3:
         st.warning("Not enough points to build contour.")
         return None, None, None, None, None
@@ -50,8 +52,14 @@ def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True, title="R
     XI, YI = np.meshgrid(xi, yi)
     ZI = interp(XI, YI)
 
+    # Levels based on custom or data-driven range
+    if vmin is None: vmin = np.nanmin(z)
+    if vmax is None: vmax = np.nanmax(z)
+    if vmax <= vmin: vmax = vmin + 1e-6
+    levels = np.linspace(vmin, vmax, nlevels)
+
     fig, ax = plt.subplots(figsize=(8, 7))
-    hm = ax.contourf(XI, YI, ZI, levels=20)
+    hm = ax.contourf(XI, YI, ZI, levels=levels, vmin=vmin, vmax=vmax)
     if target is not None:
         try:
             ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
@@ -78,12 +86,11 @@ def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True, title="R
 
 def capacity_envelope_vs_radius(df_env):
     """
-    Build a clean capacity-vs-radius envelope from scattered (R, Load) samples:
-    1) Round radius to 2 decimals to coalesce near-duplicates.
-    2) Take max SWL at each rounded radius.
-    3) Sort by radius.
-    4) Enforce non-increasing SWL with radius (right-to-left running max)
-       to remove aliasing ripples from angle->radius sampling.
+    Ripple-free envelope:
+    1) Round radius to 2 decimals
+    2) Max SWL per rounded radius
+    3) Sort by radius
+    4) Enforce non-increasing SWL with radius
     """
     if df_env.empty:
         return np.array([]), np.array([])
@@ -99,7 +106,6 @@ def capacity_envelope_vs_radius(df_env):
     xs = agg["r"].to_numpy()
     ys = agg["L"].to_numpy()
 
-    # enforce monotone non-increasing envelope
     ys = np.maximum.accumulate(ys[::-1])[::-1]
     return xs, ys
 
@@ -220,6 +226,17 @@ def main():
         st.markdown("#### Geometry options")
         relative = st.checkbox("Folding angle is **relative** to main angle", value=True, help="If unchecked, folding angle is treated as absolute.")
 
+        # ---- Custom scale for rated capacity (contour) chart ----
+        st.markdown("#### Plot scale")
+        minL, maxL = float(df_env["Load"].min()), float(df_env["Load"].max())
+        use_custom_scale = st.checkbox("Custom load scale [t]", value=False, help="Set colorbar/contour scale limits")
+        if use_custom_scale:
+            vmin = st.number_input("Scale min [t]", value=float(np.floor(minL)), step=0.1, format="%.1f")
+            vmax = st.number_input("Scale max [t]", value=float(np.ceil(maxL)), step=0.1, format="%.1f")
+        else:
+            vmin = None
+            vmax = None
+
         # Distance from hull
         dist_from_hull = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
 
@@ -274,7 +291,6 @@ def main():
             st.text("DAF")
             st.header(f"{daf:.2f}" if np.isfinite(daf) else "-")
 
-        minL, maxL = float(df_env["Load"].min()), float(df_env["Load"].max())
         target = synced_slider_number("Iso-load [t] (overlay)", "iso_load", minL, maxL,
                                       default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
@@ -283,11 +299,16 @@ def main():
         y = (df_env["Height"] + (deck_offset if use_deck else 0.0)).values.astype(float)
         z = df_env["Load"].values.astype(float)
 
+        # Dynamic titles with Environment & Cd
+        title_contour = f"Rated Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Rated Capacity - {chosen_env}"
+        title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
+
         fig, XI, YI, ZI, ax = contour_plot(
             x, y, z,
             target=target,
             marker=(ox, hz),
-            title="Rated capacity related to height and radius"
+            title=title_contour,
+            vmin=vmin, vmax=vmax
         )
         if fig is not None:
             draw_crane_aligned(ax, main_angle, fold_angle,
@@ -310,7 +331,7 @@ def main():
                 ax2.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red", markeredgecolor="red", linestyle="None", label="Current point")
             ax2.set_xlabel("RADIUS (m)")
             ax2.set_ylabel("SWL (t)")
-            ax2.set_title("OFFSHORE LIFT CAPACITY")
+            ax2.set_title(title_capacity)
             ax2.grid(True, alpha=0.3)
             ax2.legend(loc="best")
             st.pyplot(fig2, use_container_width=True)
