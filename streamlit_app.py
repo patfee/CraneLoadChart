@@ -36,7 +36,7 @@ def nearest_point(df, fold_angle, main_angle):
 def contour_plot(
     x, y, z, target=None, marker=None, show_colorbar=True,
     title="Rated capacity related to height and radius",
-    vmin=None, vmax=None, nlevels=20
+    nlevels=20
 ):
     if len(x) < 3 or len(y) < 3:
         st.warning("Not enough points to build contour.")
@@ -54,17 +54,21 @@ def contour_plot(
     XI, YI = np.meshgrid(xi, yi)
     ZI = interp(XI, YI)
 
-    # Levels based on custom or data-driven range
-    if vmin is None: vmin = np.nanmin(z)
-    if vmax is None: vmax = np.nanmax(z)
-    if vmax <= vmin: vmax = vmin + 1e-6
+    vmin = np.nanmin(z)
+    vmax = np.nanmax(z)
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
     levels = np.linspace(vmin, vmax, nlevels)
 
     fig, ax = plt.subplots(figsize=(8, 7))
     hm = ax.contourf(XI, YI, ZI, levels=levels, vmin=vmin, vmax=vmax)
+
+    # Single iso-load overlay with label
     if target is not None:
         try:
-            ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
+            cs = ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
+            # Label the line with "<value> t"
+            ax.clabel(cs, fmt=lambda v: f"{v:.1f} t", inline=True, fontsize=10)
         except Exception:
             pass
 
@@ -138,12 +142,10 @@ def synced_slider_number(label, key_base, min_val, max_val, default, step=0.01, 
 
 
 @st.cache_data
-def estimate_geometry(df_subset: pd.DataFrame, relative=True):
+def estimate_geometry(df_subset: pd.DataFrame):
+    # Folding angle is ALWAYS treated as relative to main angle
     thetas1 = np.deg2rad(df_subset["MainJib"].values.astype(float))
-    if relative:
-        thetas2 = np.deg2rad((df_subset["MainJib"] + df_subset["FoldingJib"]).values.astype(float))
-    else:
-        thetas2 = np.deg2rad(df_subset["FoldingJib"].values.astype(float))
+    thetas2 = np.deg2rad((df_subset["MainJib"] + df_subset["FoldingJib"]).values.astype(float))
 
     x = df_subset["Outreach"].values.astype(float)
     y = df_subset["Height"].values.astype(float)
@@ -162,9 +164,9 @@ def elbow_point(main_deg, x0, y0, L1):
     return (x0 + L1*np.cos(t1), y0 + L1*np.sin(t1))
 
 
-def draw_crane_aligned(ax, main_deg, fold_deg, base_offset_y, df_env, relative=True, hook_target=None, color="white"):
+def draw_crane_aligned(ax, main_deg, fold_deg, base_offset_y, df_env, hook_target=None, color="white"):
     try:
-        x0, y0, L1, L2 = estimate_geometry(df_env[["MainJib","FoldingJib","Outreach","Height"]], relative=relative)
+        x0, y0, L1, L2 = estimate_geometry(df_env[["MainJib","FoldingJib","Outreach","Height"]])
     except Exception:
         x0, y0, L1, L2 = 0.0, 0.0, 10.0, 10.0
 
@@ -186,28 +188,6 @@ def draw_crane_aligned(ax, main_deg, fold_deg, base_offset_y, df_env, relative=T
         hx, hy = hook_target
         ax.plot([ex, hx], [ey, hy], color=color, linewidth=2.0)
         ax.plot(hx, hy, "o", color=color, markersize=4)
-
-
-def max_load_for_angles(df_scope: pd.DataFrame, nearest_main: float, nearest_fold: float, tol: float = 1e-6):
-    """
-    Return (max_load, env_label, cond_label) for the given angles, but *within* df_scope
-    (i.e., the currently selected chart/environment). Uses a tolerant match; if no exact
-    match, falls back to the nearest row in df_scope.
-    """
-    if df_scope.empty or not np.isfinite(nearest_main) or not np.isfinite(nearest_fold):
-        return np.nan, "", ""
-
-    m = (np.isclose(df_scope["MainJib"].to_numpy(dtype=float), nearest_main, atol=tol) &
-         np.isclose(df_scope["FoldingJib"].to_numpy(dtype=float), nearest_fold, atol=tol))
-    same_angles = df_scope[m]
-
-    if same_angles.empty:
-        idx_env = ((df_scope["FoldingJib"] - nearest_fold).abs() + (df_scope["MainJib"] - nearest_main).abs()).idxmin()
-        row_max = df_scope.loc[idx_env]
-        return float(row_max["Load"]), str(row_max.get("Environment","")), str(row_max.get("Condition",""))
-
-    row_max = same_angles.loc[same_angles["Load"].idxmax()]
-    return float(row_max["Load"]), str(row_max.get("Environment","")), str(row_max.get("Condition",""))
 
 
 def main():
@@ -247,32 +227,8 @@ def main():
 
         hz = hz_raw + (deck_offset if use_deck else 0.0)
 
-        st.markdown("#### Geometry options")
-        relative = st.checkbox("Folding angle is **relative** to main angle", value=True, help="If unchecked, folding angle is treated as absolute.")
-
-        # ---- Custom scale for rated capacity (contour) chart ----
-        st.markdown("#### Plot scale")
-        minL, maxL = float(df_env["Load"].min()), float(df_env["Load"].max())
-        use_custom_scale = st.checkbox("Custom load scale [t]", value=False, help="Set colorbar/contour scale limits")
-        if use_custom_scale:
-            vmin = st.number_input("Scale min [t]", value=float(np.floor(minL)), step=0.1, format="%.1f")
-            vmax = st.number_input("Scale max [t]", value=float(np.ceil(maxL)), step=0.1, format="%.1f")
-        else:
-            vmin = None
-            vmax = None
-
         # Distance from hull
         dist_from_hull = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
-
-        # ---- Max load at these angles, scoped to the SELECTED chart (df_env) ----
-        try:
-            idx_env = ((df_env["FoldingJib"] - fold_angle).abs() + (df_env["MainJib"] - main_angle).abs()).idxmin()
-            nearest_main = float(df_env.loc[idx_env, "MainJib"])
-            nearest_fold = float(df_env.loc[idx_env, "FoldingJib"])
-        except Exception:
-            nearest_main, nearest_fold = np.nan, np.nan
-
-        max_load_at_angles, max_env_label, max_cond_label = max_load_for_angles(df_env, nearest_main, nearest_fold)
 
         k1, k2 = st.columns(2)
         with k1:
@@ -280,21 +236,9 @@ def main():
             st.header(f"{ox:.2f}" if np.isfinite(ox) else "-")
             st.text("Rated load [t]")
             st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
-            st.text("Max load @ angles [t]")
-            if np.isfinite(max_load_at_angles):
-                angle_info = ""
-                if np.isfinite(nearest_main) and np.isfinite(nearest_fold):
-                    angle_info = f" — Main: {nearest_main:.2f}°, Folding: {nearest_fold:.2f}°"
-                st.markdown(
-                    f"<h3>{max_load_at_angles:.1f}</h3>"
-                    f"<div style='font-size:0.85rem;color:#aaa'>({max_env_label} / {max_cond_label}){angle_info}</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.header("-")
             st.text("Distance from hull [m]")
             if np.isfinite(dist_from_hull) and dist_from_hull < 0:
-                st.markdown(f"<h3 style='color:#cc0000'>{-abs(dist_from_hull):.2f}</h3>", unsafe_allow_html=True)
+                st.markdown(f"<h3 style='color:#cc0000'>{dist_from_hull:.2f}</h3>", unsafe_allow_html=True)
             else:
                 st.header(f"{dist_from_hull:.2f}" if np.isfinite(dist_from_hull) else "-")
         with k2:
@@ -303,6 +247,8 @@ def main():
             st.text("DAF")
             st.header(f"{daf:.2f}" if np.isfinite(daf) else "-")
 
+        # Iso-load overlay control (value is also printed on the contour line in the chart)
+        minL, maxL = float(df_env["Load"].min()), float(df_env["Load"].max())
         target = synced_slider_number("Iso-load [t] (overlay)", "iso_load", minL, maxL,
                                       default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
@@ -319,14 +265,13 @@ def main():
             x, y, z,
             target=target,
             marker=(ox, hz),
-            title=title_contour,
-            vmin=vmin, vmax=vmax
+            title=title_contour
         )
         if fig is not None:
             draw_crane_aligned(
                 ax, main_angle, fold_angle,
                 base_offset_y=(deck_offset if use_deck else 0.0),
-                df_env=df_env, relative=relative, hook_target=(ox, hz), color="white"
+                df_env=df_env, hook_target=(ox, hz), color="white"
             )
             st.pyplot(fig, use_container_width=True)
 
