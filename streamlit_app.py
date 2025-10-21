@@ -59,6 +59,10 @@ def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True, title="R
         except Exception:
             pass
 
+    # Hull side guideline
+    ax.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
+    ax.text(PEDESTAL_INBOARD_M, ax.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
+
     if marker is not None and all(np.isfinite(marker)):
         ox, hz = marker
         ax.plot([ox], [hz], marker="o", markersize=7, markerfacecolor="red", markeredgecolor="red")
@@ -204,7 +208,7 @@ def main():
         st.markdown("#### Geometry options")
         relative = st.checkbox("Folding angle is **relative** to main angle", value=True, help="If unchecked, folding angle is treated as absolute.")
 
-        # Distance from hull (hull is 2.26 m outboard from pedestal centre)
+        # Distance from hull
         dist_from_hull = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
 
         k1, k2 = st.columns(2)
@@ -214,7 +218,10 @@ def main():
             st.text("Rated load [t]")
             st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
             st.text("Distance from hull [m]")
-            st.header(f"{dist_from_hull:.2f}" if np.isfinite(dist_from_hull) else "-")
+            if np.isfinite(dist_from_hull) and dist_from_hull < 0:
+                st.markdown(f"<h3 style='color:#cc0000'>{dist_from_hull:.2f}</h3>", unsafe_allow_html=True)
+            else:
+                st.header(f"{dist_from_hull:.2f}" if np.isfinite(dist_from_hull) else "-")
         with k2:
             st.text(("Height above deck [m]" if use_deck else "Height [m]"))
             st.header(f"{hz:.2f}" if np.isfinite(hz) else "-")
@@ -242,13 +249,17 @@ def main():
                                df_env=df_env, relative=relative, hook_target=(ox, hz), color="white")
             st.pyplot(fig, use_container_width=True)
 
-        # ----- Offshore lift capacity chart with RED dot for current point -----
+        # ----- Offshore lift capacity chart with RED dot + hull guideline -----
         st.markdown("### Print chart")
         xs, ys = capacity_envelope_vs_radius(df_env)
 
         if len(xs) and len(ys):
             fig2, ax2 = plt.subplots(figsize=(8, 4.5))
             ax2.plot(xs, ys, linewidth=2.0, label="Envelope")
+            # Hull side guideline
+            ax2.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
+            ax2.text(PEDESTAL_INBOARD_M, ax2.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
+            # Current point marker
             if np.isfinite(ox) and np.isfinite(rated):
                 ax2.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red", markeredgecolor="red", linestyle="None", label="Current point")
             ax2.set_xlabel("RADIUS (m)")
