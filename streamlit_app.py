@@ -33,9 +33,11 @@ def nearest_point(df, fold_angle, main_angle):
     return float(row["Outreach"]), float(row["Height"]), float(row["Load"])
 
 
-def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True,
-                 title="Rated capacity related to height and radius",
-                 vmin=None, vmax=None, nlevels=20):
+def contour_plot(
+    x, y, z, target=None, marker=None, show_colorbar=True,
+    title="Rated capacity related to height and radius",
+    vmin=None, vmax=None, nlevels=20
+):
     if len(x) < 3 or len(y) < 3:
         st.warning("Not enough points to build contour.")
         return None, None, None, None, None
@@ -186,6 +188,28 @@ def draw_crane_aligned(ax, main_deg, fold_deg, base_offset_y, df_env, relative=T
         ax.plot(hx, hy, "o", color=color, markersize=4)
 
 
+def max_load_for_angles(df_scope: pd.DataFrame, nearest_main: float, nearest_fold: float, tol: float = 1e-6):
+    """
+    Return (max_load, env_label, cond_label) for the given angles, but *within* df_scope
+    (i.e., the currently selected chart/environment). Uses a tolerant match; if no exact
+    match, falls back to the nearest row in df_scope.
+    """
+    if df_scope.empty or not np.isfinite(nearest_main) or not np.isfinite(nearest_fold):
+        return np.nan, "", ""
+
+    m = (np.isclose(df_scope["MainJib"].to_numpy(dtype=float), nearest_main, atol=tol) &
+         np.isclose(df_scope["FoldingJib"].to_numpy(dtype=float), nearest_fold, atol=tol))
+    same_angles = df_scope[m]
+
+    if same_angles.empty:
+        idx_env = ((df_scope["FoldingJib"] - nearest_fold).abs() + (df_scope["MainJib"] - nearest_main).abs()).idxmin()
+        row_max = df_scope.loc[idx_env]
+        return float(row_max["Load"]), str(row_max.get("Environment","")), str(row_max.get("Condition",""))
+
+    row_max = same_angles.loc[same_angles["Load"].idxmax()]
+    return float(row_max["Load"]), str(row_max.get("Environment","")), str(row_max.get("Condition",""))
+
+
 def main():
     st.markdown("## DCN Picasso DSV Crane Curve Interface")
 
@@ -240,7 +264,7 @@ def main():
         # Distance from hull
         dist_from_hull = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
 
-        # Max load across all environments for these angles + labels
+        # ---- Max load at these angles, scoped to the SELECTED chart (df_env) ----
         try:
             idx_env = ((df_env["FoldingJib"] - fold_angle).abs() + (df_env["MainJib"] - main_angle).abs()).idxmin()
             nearest_main = float(df_env.loc[idx_env, "MainJib"])
@@ -248,19 +272,7 @@ def main():
         except Exception:
             nearest_main, nearest_fold = np.nan, np.nan
 
-        if np.isfinite(nearest_main) and np.isfinite(nearest_fold):
-            same_angles = df_all[(df_all["MainJib"] == nearest_main) & (df_all["FoldingJib"] == nearest_fold)]
-            if not same_angles.empty:
-                max_load_at_angles = float(same_angles["Load"].max())
-                row_max = same_angles.loc[same_angles["Load"].idxmax()]
-                max_env_label = str(row_max.get("Environment", ""))
-                max_cond_label = str(row_max.get("Condition", ""))
-            else:
-                max_load_at_angles = np.nan
-                max_env_label = max_cond_label = ""
-        else:
-            max_load_at_angles = np.nan
-            max_env_label = max_cond_label = ""
+        max_load_at_angles, max_env_label, max_cond_label = max_load_for_angles(df_env, nearest_main, nearest_fold)
 
         k1, k2 = st.columns(2)
         with k1:
@@ -282,7 +294,7 @@ def main():
                 st.header("-")
             st.text("Distance from hull [m]")
             if np.isfinite(dist_from_hull) and dist_from_hull < 0:
-                st.markdown(f"<h3 style='color:#cc0000'>{dist_from_hull:.2f}</h3>", unsafe_allow_html=True)
+                st.markdown(f"<h3 style='color:#cc0000'>{-abs(dist_from_hull):.2f}</h3>", unsafe_allow_html=True)
             else:
                 st.header(f"{dist_from_hull:.2f}" if np.isfinite(dist_from_hull) else "-")
         with k2:
@@ -311,9 +323,11 @@ def main():
             vmin=vmin, vmax=vmax
         )
         if fig is not None:
-            draw_crane_aligned(ax, main_angle, fold_angle,
-                               base_offset_y=(deck_offset if use_deck else 0.0),
-                               df_env=df_env, relative=relative, hook_target=(ox, hz), color="white")
+            draw_crane_aligned(
+                ax, main_angle, fold_angle,
+                base_offset_y=(deck_offset if use_deck else 0.0),
+                df_env=df_env, relative=relative, hook_target=(ox, hz), color="white"
+            )
             st.pyplot(fig, use_container_width=True)
 
         # ----- Offshore lift capacity chart with RED dot + hull guideline -----
@@ -328,7 +342,8 @@ def main():
             ax2.text(PEDESTAL_INBOARD_M, ax2.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
             # Current point marker
             if np.isfinite(ox) and np.isfinite(rated):
-                ax2.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red", markeredgecolor="red", linestyle="None", label="Current point")
+                ax2.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red",
+                         markeredgecolor="red", linestyle="None", label="Current point")
             ax2.set_xlabel("RADIUS (m)")
             ax2.set_ylabel("SWL (t)")
             ax2.set_title(title_capacity)
@@ -337,9 +352,12 @@ def main():
             st.pyplot(fig2, use_container_width=True)
 
             env_csv = pd.DataFrame({"Radius_m": xs, "SWL_t": ys})
-            st.download_button("Download capacity curve CSV",
-                               env_csv.to_csv(index=False).encode("utf-8"),
-                               file_name=f"capacity_curve_{chosen_env}.csv", mime="text/csv")
+            st.download_button(
+                "Download capacity curve CSV",
+                env_csv.to_csv(index=False).encode("utf-8"),
+                file_name=f"capacity_curve_{chosen_env}.csv",
+                mime="text/csv"
+            )
         else:
             st.info("No data available to build capacity curve for the selected environment.")
 
