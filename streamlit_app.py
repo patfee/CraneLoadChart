@@ -33,24 +33,20 @@ def nearest_point(df, fold_angle, main_angle):
     return float(row["Outreach"]), float(row["Height"]), float(row["Load"])
 
 
-def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Rated capacity related to height and radius"):
-    if df_env.empty:
-        st.warning("No data to plot for this environment/filters.")
-        return None, None, None, None
-    x = df_env["Outreach"].values
-    y = df_env["Height"].values
-    z = df_env["Load"].values
-
+def contour_plot(x, y, z, target=None, marker=None, show_colorbar=True, title="Rated capacity related to height and radius"):
+    if len(x) < 3 or len(y) < 3:
+        st.warning("Not enough points to build contour.")
+        return None, None, None, None, None
     if len(np.unique(x)) < 3 or len(np.unique(y)) < 3:
         st.warning("Not enough unique (Outreach, Height) points to build contour.")
-        return None, None, None, None
+        return None, None, None, None, None
 
     tri = Triangulation(x, y)
     interp = LinearTriInterpolator(tri, z)
 
     n = 400
-    xi = np.linspace(x.min(), x.max(), n)
-    yi = np.linspace(y.min(), y.max(), n)
+    xi = np.linspace(np.min(x), np.max(x), n)
+    yi = np.linspace(np.min(y), np.max(y), n)
     XI, YI = np.meshgrid(xi, yi)
     ZI = interp(XI, YI)
 
@@ -58,7 +54,7 @@ def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Ra
     hm = ax.contourf(XI, YI, ZI, levels=20)
     if target is not None:
         try:
-            ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
+            ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0, colors=['#34113F'])
         except Exception:
             pass
 
@@ -116,79 +112,55 @@ def synced_slider_number(label, key_base, min_val, max_val, default, step=0.01, 
     return float(st.session_state[key_base])
 
 
-# -------- Geometry estimation and drawing --------
 @st.cache_data
-def estimate_geometry(df_all: pd.DataFrame, relative=True):
-    """Least-squares estimate of base (x0,y0), main length L1, folding length L2."""
-    # Use all unique rows to fit
-    thetas1 = np.deg2rad(df_all["MainJib"].values.astype(float))
+def estimate_geometry(df_subset: pd.DataFrame, relative=True):
+    thetas1 = np.deg2rad(df_subset["MainJib"].values.astype(float))
     if relative:
-        thetas2 = np.deg2rad((df_all["MainJib"] + df_all["FoldingJib"]).values.astype(float))
+        thetas2 = np.deg2rad((df_subset["MainJib"] + df_subset["FoldingJib"]).values.astype(float))
     else:
-        thetas2 = np.deg2rad(df_all["FoldingJib"].values.astype(float))
+        thetas2 = np.deg2rad(df_subset["FoldingJib"].values.astype(float))
 
-    x = df_all["Outreach"].values.astype(float)
-    y = df_all["Height"].values.astype(float)
+    x = df_subset["Outreach"].values.astype(float)
+    y = df_subset["Height"].values.astype(float)
 
-    # Build linear system for parameters [x0, y0, L1, L2]
-    # x = x0 + L1*cos(t1) + L2*cos(t2)
-    # y = y0 + L1*sin(t1) + L2*sin(t2)
-    # Stack equations
     n = len(x)
-    A = np.zeros((2*n, 4))
-    b = np.zeros(2*n)
-    A[0:n, 0] = 1.0       # x0
-    A[0:n, 2] = np.cos(thetas1)  # L1
-    A[0:n, 3] = np.cos(thetas2)  # L2
-    b[0:n] = x
-
-    A[n:, 1] = 1.0        # y0
-    A[n:, 2] = np.sin(thetas1)   # L1
-    A[n:, 3] = np.sin(thetas2)   # L2
-    b[n:] = y
-
-    # Solve least squares
+    A = np.zeros((2*n, 4)); b = np.zeros(2*n)
+    A[0:n, 0] = 1.0; A[0:n, 2] = np.cos(thetas1); A[0:n, 3] = np.cos(thetas2); b[0:n] = x
+    A[n:, 1] = 1.0; A[n:, 2] = np.sin(thetas1); A[n:, 3] = np.sin(thetas2); b[n:] = y
     params, *_ = np.linalg.lstsq(A, b, rcond=None)
     x0, y0, L1, L2 = params
     return float(x0), float(y0), float(L1), float(L2)
 
 
-def forward_kinematics(main_deg, fold_deg, x0, y0, L1, L2, relative=True):
+def elbow_point(main_deg, x0, y0, L1):
     t1 = np.deg2rad(main_deg)
-    if relative:
-        t2 = np.deg2rad(main_deg + fold_deg)
-    else:
-        t2 = np.deg2rad(fold_deg)
-    x_elbow = x0 + L1*np.cos(t1)
-    y_elbow = y0 + L1*np.sin(t1)
-    x_tip = x_elbow + L2*np.cos(t2)
-    y_tip = y_elbow + L2*np.sin(t2)
-    return (x0, y0), (x_elbow, y_elbow), (x_tip, y_tip)
+    return (x0 + L1*np.cos(t1), y0 + L1*np.sin(t1))
 
 
-def draw_crane(ax, main_deg, fold_deg, df_env, relative=True, color="white"):
-    # Estimate geometry from the selected environment (should be same for all envs)
+def draw_crane_aligned(ax, main_deg, fold_deg, base_offset_y, df_env, relative=True, hook_target=None, color="white"):
     try:
         x0, y0, L1, L2 = estimate_geometry(df_env[["MainJib","FoldingJib","Outreach","Height"]], relative=relative)
     except Exception:
-        # fallback to using all data
-        x0, y0, L1, L2 = estimate_geometry(df, relative=relative)
+        x0, y0, L1, L2 = 0.0, 0.0, 10.0, 10.0
 
-    base, elbow, tip = forward_kinematics(main_deg, fold_deg, x0, y0, L1, L2, relative=relative)
-    # Draw base square for reference
-    bx, by = base
+    y0 = y0 + base_offset_y
+
+    ex, ey = elbow_point(main_deg, x0, y0, L1)
+    bx, by = x0, y0
+
     size = max(L1, L2) * 0.04
     rect_x = [bx - size, bx + size, bx + size, bx - size, bx - size]
     rect_y = [by - size, by - size, by + size, by + size, by - size]
     ax.plot(rect_x, rect_y, color=color, linewidth=1.5)
 
-    # Links
-    ax.plot([base[0], elbow[0]], [base[1], elbow[1]], color=color, linewidth=2.0)
-    ax.plot([elbow[0], tip[0]], [elbow[1], tip[1]], color=color, linewidth=2.0)
-    # Joints
-    ax.plot(base[0], base[1], "o", color=color, markersize=4, markerfacecolor=color)
-    ax.plot(elbow[0], elbow[1], "o", color=color, markersize=4, markerfacecolor=color)
-    ax.plot(tip[0], tip[1], "o", color=color, markersize=4, markerfacecolor=color)
+    ax.plot([bx, ex], [by, ey], color=color, linewidth=2.0)
+    ax.plot(bx, by, "o", color=color, markersize=4)
+    ax.plot(ex, ey, "o", color=color, markersize=4)
+
+    if hook_target is not None and all(np.isfinite(hook_target)):
+        hx, hy = hook_target
+        ax.plot([ex, hx], [ey, hy], color=color, linewidth=2.0)
+        ax.plot(hx, hy, "o", color=color, markersize=4)
 
 
 def main():
@@ -219,10 +191,15 @@ def main():
         fold_angle = synced_slider_number("Folding angle [deg]", "fold_angle",
                                           fj_min, fj_max, default=(fj_min+fj_max)/2, step=0.01)
 
-        ox, hz, rated = nearest_point(df_env, fold_angle, main_angle)
+        ox, hz_raw, rated = nearest_point(df_env, fold_angle, main_angle)
         daf = float(df_env["Cd"].iloc[0]) if "Cd" in df_env.columns and not df_env.empty else np.nan
 
-        # Geometry options
+        st.markdown("#### Height reference")
+        use_deck = st.checkbox("Reference height to **deck** (deck below slew bearing)", value=True)
+        deck_offset = st.number_input("Deck offset [m] (positive if deck is below bearing)", value=6.0, step=0.1, format="%.1f")
+
+        hz = hz_raw + (deck_offset if use_deck else 0.0)
+
         st.markdown("#### Geometry options")
         relative = st.checkbox("Folding angle is **relative** to main angle", value=True, help="If unchecked, folding angle is treated as absolute.")
 
@@ -233,7 +210,7 @@ def main():
             st.text("Rated load [t]")
             st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
         with k2:
-            st.text("Height [m]")
+            st.text(("Height above deck [m]" if use_deck else "Height [m]"))
             st.header(f"{hz:.2f}" if np.isfinite(hz) else "-")
             st.text("DAF")
             st.header(f"{daf:.2f}" if np.isfinite(daf) else "-")
@@ -243,15 +220,20 @@ def main():
                                       default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
     with left:
+        x = df_env["Outreach"].values.astype(float)
+        y = (df_env["Height"] + (deck_offset if use_deck else 0.0)).values.astype(float)
+        z = df_env["Load"].values.astype(float)
+
         fig, XI, YI, ZI, ax = contour_plot(
-            df_env,
+            x, y, z,
             target=target,
             marker=(ox, hz),
             title="Rated capacity related to height and radius"
         )
         if fig is not None:
-            # Overlay dynamic crane geometry
-            draw_crane(ax, main_angle, fold_angle, df_env, relative=relative, color="white")
+            draw_crane_aligned(ax, main_angle, fold_angle,
+                               base_offset_y=(deck_offset if use_deck else 0.0),
+                               df_env=df_env, relative=relative, hook_target=(ox, hz), color="white")
             st.pyplot(fig, use_container_width=True)
 
         st.markdown("### Print chart")
