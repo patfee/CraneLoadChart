@@ -1,199 +1,175 @@
 import os
-import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.tri import Triangulation, LinearTriInterpolator
 
-st.set_page_config(page_title="Knuckle Boom Crane Curves", layout="wide")
+st.set_page_config(page_title="Crane Curve Viewer", layout="wide")
 
 DATA_PATH = "./data/CraneData_streamlit_long.csv"
 
 @st.cache_data
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # Basic schema sanity
-    required = ["FoldingJib","MainJib","Outreach","Height","Condition","Environment","Cd","Load"]
-    missing = [c for c in required if c not in df.columns]
+    req = ["FoldingJib","MainJib","Outreach","Height","Condition","Environment","Cd","Load"]
+    missing = [c for c in req if c not in df.columns]
     if missing:
-        raise ValueError(f"CSV missing required columns: {missing}")
-    # Enforce dtypes
-    for col in ["FoldingJib","MainJib","Outreach","Height","Cd","Load"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["Environment"] = df["Environment"].astype("category")
-    df["Condition"] = df["Condition"].astype("category")
-    # Drop clearly invalid rows
+        raise ValueError(f"Missing required columns: {missing}")
+    for c in ["FoldingJib","MainJib","Outreach","Height","Cd","Load"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["FoldingJib","MainJib","Outreach","Height","Load"])
+    df["Environment"] = df["Environment"].astype("category")
     return df
 
-def download_link(df: pd.DataFrame, filename: str, label: str = "Download CSV"):
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(label, data=csv, file_name=filename, mime="text/csv")
+def nearest_point(df, fold_angle, main_angle):
+    # Pick the row nearest to the requested angles
+    idx = ((df["FoldingJib"] - fold_angle).abs() + (df["MainJib"] - main_angle).abs()).idxmin()
+    row = df.loc[idx]
+    return float(row["Outreach"]), float(row["Height"]), float(row["Load"])
 
-def sidebar_filters(df: pd.DataFrame):
-    st.sidebar.header("Filters")
-    envs = sorted(df["Environment"].dropna().unique().tolist())
-    env = st.sidebar.selectbox("Environment", envs, index=0 if envs else None)
-    df = df[df["Environment"] == env]
-
-    # Optional angle filters
-    st.sidebar.subheader("Angle filters (optional)")
-    fj_min, fj_max = float(df["FoldingJib"].min()), float(df["FoldingJib"].max())
-    mj_min, mj_max = float(df["MainJib"].min()), float(df["MainJib"].max())
-    fj_range = st.sidebar.slider("FoldingJib range (deg)", fj_min, fj_max, (fj_min, fj_max), step=0.01)
-    mj_range = st.sidebar.slider("MainJib range (deg)", mj_min, mj_max, (mj_min, mj_max), step=0.01)
-    df = df[(df["FoldingJib"].between(*fj_range)) & (df["MainJib"].between(*mj_range))]
-
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Data file")
-    st.sidebar.code(os.path.abspath(DATA_PATH))
-
-    return df, env, fj_range, mj_range
-
-def plot_isoload_contour(df: pd.DataFrame, env: str):
-    st.subheader(f"Iso-load curve — {env}")
-    minL, maxL = float(df["Load"].min()), float(df["Load"].max())
-    default_target = np.clip((minL + maxL) / 2, minL, maxL)
-    target = st.slider("Iso-load target (t)", minL, maxL, float(np.round(default_target, 1)), step=0.1)
-
-    # Build triangulation in the XY-plane: Outreach vs Height
-    x = df["Outreach"].values
-    y = df["Height"].values
-    z = df["Load"].values
-
-    # Defensive: ensure we have enough unique points
-    if len(x) < 10 or len(np.unique(x)) < 3 or len(np.unique(y)) < 3:
-        st.warning("Not enough unique (Outreach, Height) points to compute contour.")
-        return
+def contour_plot(df_env, target=None, marker=None, show_colorbar=True, title="Rated capacity related to height and radius"):
+    # Build interpolation in (Outreach, Height) plane
+    x = df_env["Outreach"].values
+    y = df_env["Height"].values
+    z = df_env["Load"].values
 
     tri = Triangulation(x, y)
-    # Interpolator for smooth contouring
     interp = LinearTriInterpolator(tri, z)
 
-    # Create a regular grid for plotting
-    n = 400  # dense grid
+    n = 400
     xi = np.linspace(x.min(), x.max(), n)
     yi = np.linspace(y.min(), y.max(), n)
     XI, YI = np.meshgrid(xi, yi)
     ZI = interp(XI, YI)
 
-    fig, ax = plt.subplots(figsize=(7.5, 6.5))
-    # filled background heatmap
-    hm = ax.contourf(XI, YI, ZI, levels=16)
-    # iso-load line
-    cs = ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
-
-    # Labels and colorbar
-    ax.set_xlabel("Outreach (m)")
-    ax.set_ylabel("Hook Height (m)")
-    ax.set_title(f"Iso-load ≈ {target:.2f} t — {env}")
-    cbar = fig.colorbar(hm, ax=ax, shrink=0.85)
-    cbar.set_label("Load (t)")
-
-    st.pyplot(fig)
-
-    # Extract the iso-line as a dataframe (if contour exists)
-    iso_points = []
-    if len(cs.allsegs) and len(cs.allsegs[0]):
-        for seg in cs.allsegs[0]:
-            for (xx, yy) in seg:
-                iso_points.append((xx, yy, target))
-    if iso_points:
-        iso_df = pd.DataFrame(iso_points, columns=["Outreach","Height","LoadTarget"])
-        st.caption("Extracted iso-load polyline points")
-        st.dataframe(iso_df.head(200))
-        download_link(iso_df, f"iso_{env}_{target:.2f}t.csv", "Download iso-load polyline")
-
-def plot_heatmap(df: pd.DataFrame, env: str):
-    st.subheader(f"Heatmap — Load over (Outreach, Height) — {env}")
-
-    x = df["Outreach"].values
-    y = df["Height"].values
-    z = df["Load"].values
-
-    tri = Triangulation(x, y)
-    interp = LinearTriInterpolator(tri, z)
-
-    n = 300
-    xi = np.linspace(x.min(), x.max(), n)
-    yi = np.linspace(y.min(), y.max(), n)
-    XI, YI = np.meshgrid(xi, yi)
-    ZI = interp(XI, YI)
-
-    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    fig, ax = plt.subplots(figsize=(8, 7))
     hm = ax.contourf(XI, YI, ZI, levels=20)
-    ax.set_xlabel("Outreach (m)")
-    ax.set_ylabel("Hook Height (m)")
-    ax.set_title(f"Load (t) — {env}")
-    cbar = fig.colorbar(hm, ax=ax, shrink=0.85)
-    cbar.set_label("Load (t)")
+    if target is not None:
+        ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
 
-    st.pyplot(fig)
+    if marker is not None:
+        ox, hz = marker
+        ax.plot([ox], [hz], marker="o", markersize=6)
 
-def plot_angle_slices(df: pd.DataFrame, env: str):
-    st.subheader(f"Slices — angle-curves — {env}")
-    mode = st.radio("Slice mode", ["Fix FoldingJib (vary MainJib)", "Fix MainJib (vary FoldingJib)"], horizontal=True)
-    measure = st.selectbox("Y-axis", ["Load","Height","Outreach"], index=0)
+    ax.set_xlabel("y Radius [m]")
+    ax.set_ylabel("z Height [m]")
+    ax.set_title(title)
 
-    if mode.startswith("Fix Folding"):
-        fj_vals = sorted(df["FoldingJib"].unique())
-        fj_pick = st.select_slider("FoldingJib (deg)", options=[float(np.round(v,2)) for v in fj_vals], value=float(np.round(fj_vals[len(fj_vals)//2],2)))
-        d = df[np.isclose(df["FoldingJib"], fj_pick)]
-        d = d.sort_values("MainJib")
-        x_label = "MainJib (deg)"
-        x = d["MainJib"]
-    else:
-        mj_vals = sorted(df["MainJib"].unique())
-        mj_pick = st.select_slider("MainJib (deg)", options=[float(np.round(v,2)) for v in mj_vals], value=float(np.round(mj_vals[len(mj_vals)//2],2)))
-        d = df[np.isclose(df["MainJib"], mj_pick)]
-        d = d.sort_values("FoldingJib")
-        x_label = "FoldingJib (deg)"
-        x = d["FoldingJib"]
+    if show_colorbar:
+        cbar = fig.colorbar(hm, ax=ax, shrink=0.9)
+        cbar.set_label("Load [t]")
 
-    fig, ax = plt.subplots(figsize=(7.0, 3.8))
-    ax.plot(x, d[measure], marker="o", linewidth=1.6)
-    ax.set_xlabel(x_label)
-    ax.set_ylabel(measure)
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
+    return fig
 
-    st.caption("Slice data")
-    st.dataframe(d[["FoldingJib","MainJib","Outreach","Height","Load"]].reset_index(drop=True).head(200))
-    download_link(d, f"slice_{env}_{measure}.csv", "Download slice CSV")
+def capacity_envelope_vs_radius(df_env):
+    # Build the capacity curve similar to the 2nd screenshot:
+    # For each outreach bucket, take the maximum load over all heights / angle combos.
+    g = (
+        df_env
+        .groupby(pd.cut(df_env["Outreach"], bins=200, include_lowest=True))["Load"]
+        .max()
+        .dropna()
+    )
+    # Convert IntervalIndex to midpoints
+    xs = np.array([float(iv.mid) for iv in g.index])
+    ys = g.values
+    # Sort by radius
+    order = np.argsort(xs)
+    xs = xs[order]
+    ys = ys[order]
+    return xs, ys
 
 def main():
-    st.title("Knuckle Boom Crane — Curve Explorer")
-    st.markdown("Load: **CraneData_streamlit_long.csv** in `./data/`")
+    st.markdown("## MACGREGOR-like Crane Curve Interface")
 
-    # Data loader
     try:
         df = load_data(DATA_PATH)
     except Exception as e:
         st.error(f"Could not load data from {DATA_PATH}: {e}")
         st.stop()
 
-    # Sidebar filtering
-    df_filt, env, fj_range, mj_range = sidebar_filters(df)
+    # Top environment selector (mimic the dot legend)
+    env_options = ["Harbour", "Deck", "SeaSubsea", "Subsea"]
+    # Map back to rows
+    env_label_map = {
+        "Harbour":"Harbour",
+        "Deck":"Deck",
+        "SeaSubsea":"SeaSubsea",
+        "Subsea":"Subsea",
+    }
+    cols = st.columns(len(env_options))
+    chosen_env = env_options[0]
+    for i, name in enumerate(env_options):
+        with cols[i]:
+            if st.toggle(name, value=(i==0), key=f"env_{name}"):
+                chosen_env = name
+                # Turn the others off visually by resetting state — simple selection effect
+                for j, n2 in enumerate(env_options):
+                    if n2 != name and f"env_{n2}" in st.session_state:
+                        st.session_state[f"env_{n2}"] = False
 
-    tabs = st.tabs(["Iso-load curve", "Heatmap", "Angle slices", "Table"])
+    # Filter df by environment string
+    df_env = df[df["Environment"] == env_label_map[chosen_env]]
+    if df_env.empty:
+        st.warning(f"No rows found for environment: {chosen_env}")
+        st.stop()
 
-    with tabs[0]:
-        plot_isoload_contour(df_filt, env)
+    # Layout like screenshot: Left = plot area, Right = controls
+    left, right = st.columns([2.2, 1.0])
 
-    with tabs[1]:
-        plot_heatmap(df_filt, env)
+    with right:
+        st.markdown("### Current point")
+        # Angle sliders
+        mj_min, mj_max = float(df_env["MainJib"].min()), float(df_env["MainJib"].max())
+        fj_min, fj_max = float(df_env["FoldingJib"].min()), float(df_env["FoldingJib"].max())
 
-    with tabs[2]:
-        plot_angle_slices(df_filt, env)
+        main_angle = st.slider("Main angle [deg]", mj_min, mj_max, float(np.round((mj_min+mj_max)/2,2)), step=0.01)
+        fold_angle = st.slider("Folding angle [deg]", fj_min, fj_max, float(np.round((fj_min+fj_max)/2,2)), step=0.01)
 
-    with tabs[3]:
-        st.subheader(f"Filtered rows — {env}")
-        st.dataframe(df_filt.head(500))
-        download_link(df_filt, f"filtered_{env}.csv", "Download filtered CSV")
+        # Find nearest data point + DAF (Cd)
+        ox, hz, rated = nearest_point(df_env, fold_angle, main_angle)
+        daf = float(df_env["Cd"].iloc[0]) if "Cd" in df_env.columns else np.nan
 
-    st.markdown("---")
-    st.caption("Tips: Use the sidebar to refine angles. Iso-load curve extracts the polyline of points at a chosen tonnage.")
+        # Show readouts (styled like screenshot)
+        k1, k2 = st.columns(2)
+        with k1:
+            st.text("Radius [m]")
+            st.header(f"{ox:.2f}")
+            st.text("Rated load [t]")
+            st.header(f"{rated:.1f}")
+        with k2:
+            st.text("Height [m]")
+            st.header(f"{hz:.2f}")
+            st.text("DAF")
+            st.header(f"{daf:.2f}" if not np.isnan(daf) else "-")
+
+        # Iso-load selector (optional)
+        minL, maxL = float(df_env["Load"].min()), float(df_env["Load"].max())
+        iso_default = float(np.round((minL + maxL)/2, 1))
+        target = st.slider("Iso-load [t] (overlay)", minL, maxL, iso_default, step=0.1)
+
+    with left:
+        # Main contour plot with marker and iso-load line
+        fig = contour_plot(df_env, target=target, marker=(ox, hz))
+        st.pyplot(fig, use_container_width=True)
+
+        # --- "Print chart" area (capacity curve) ---
+        st.markdown("### Print chart")
+        xs, ys = capacity_envelope_vs_radius(df_env)
+
+        fig2, ax2 = plt.subplots(figsize=(8, 4.5))
+        ax2.plot(xs, ys, linewidth=2.0)
+        ax2.set_xlabel("RADIUS (m)")
+        ax2.set_ylabel("SWL (t)")
+        ax2.set_title("OFFSHORE LIFT CAPACITY")
+        ax2.grid(True, alpha=0.3)
+        st.pyplot(fig2, use_container_width=True)
+
+        # Allow CSV download of the envelope and current point
+        env_csv = pd.DataFrame({"Radius_m": xs, "SWL_t": ys})
+        st.download_button("Download capacity curve CSV", env_csv.to_csv(index=False).encode("utf-8"),
+                           file_name=f"capacity_curve_{chosen_env}.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()
