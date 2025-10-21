@@ -9,6 +9,7 @@ from matplotlib.tri import Triangulation, LinearTriInterpolator
 st.set_page_config(page_title="Crane Curve Viewer", layout="wide")
 
 DATA_PATH = "./data/CraneData_streamlit_long.csv"
+PEDESTAL_INBOARD_M = 2.26  # centre of slew bearing is 2.26 m inboard of hull side
 
 
 @st.cache_data
@@ -203,12 +204,17 @@ def main():
         st.markdown("#### Geometry options")
         relative = st.checkbox("Folding angle is **relative** to main angle", value=True, help="If unchecked, folding angle is treated as absolute.")
 
+        # Distance from hull (hull is 2.26 m outboard from pedestal centre)
+        dist_from_hull = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
+
         k1, k2 = st.columns(2)
         with k1:
             st.text("Radius [m]")
             st.header(f"{ox:.2f}" if np.isfinite(ox) else "-")
             st.text("Rated load [t]")
             st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
+            st.text("Distance from hull [m]")
+            st.header(f"{dist_from_hull:.2f}" if np.isfinite(dist_from_hull) else "-")
         with k2:
             st.text(("Height above deck [m]" if use_deck else "Height [m]"))
             st.header(f"{hz:.2f}" if np.isfinite(hz) else "-")
@@ -236,16 +242,20 @@ def main():
                                df_env=df_env, relative=relative, hook_target=(ox, hz), color="white")
             st.pyplot(fig, use_container_width=True)
 
+        # ----- Offshore lift capacity chart with RED dot for current point -----
         st.markdown("### Print chart")
         xs, ys = capacity_envelope_vs_radius(df_env)
 
         if len(xs) and len(ys):
             fig2, ax2 = plt.subplots(figsize=(8, 4.5))
-            ax2.plot(xs, ys, linewidth=2.0)
+            ax2.plot(xs, ys, linewidth=2.0, label="Envelope")
+            if np.isfinite(ox) and np.isfinite(rated):
+                ax2.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red", markeredgecolor="red", linestyle="None", label="Current point")
             ax2.set_xlabel("RADIUS (m)")
             ax2.set_ylabel("SWL (t)")
             ax2.set_title("OFFSHORE LIFT CAPACITY")
             ax2.grid(True, alpha=0.3)
+            ax2.legend(loc="best")
             st.pyplot(fig2, use_container_width=True)
 
             env_csv = pd.DataFrame({"Radius_m": xs, "SWL_t": ys})
