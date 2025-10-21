@@ -243,7 +243,14 @@ def main():
             st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
             st.text("Max load @ angles [t]")
             if np.isfinite(max_load_at_angles):
-                st.markdown(f"<h3>{max_load_at_angles:.1f}</h3><div style='font-size:0.85rem;color:#aaa'>({max_env_label} / {max_cond_label})</div>", unsafe_allow_html=True)
+                angle_info = ""
+                if np.isfinite(nearest_main) and np.isfinite(nearest_fold):
+                    angle_info = f" — Main: {nearest_main:.2f}°, Folding: {nearest_fold:.2f}°"
+                st.markdown(
+                    f"<h3>{max_load_at_angles:.1f}</h3>"
+                    f"<div style='font-size:0.85rem;color:#aaa'>({max_env_label} / {max_cond_label}){angle_info}</div>",
+                    unsafe_allow_html=True,
+                )
             else:
                 st.header("-")
             st.text("Distance from hull [m]")
