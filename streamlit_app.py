@@ -90,52 +90,13 @@ def contour_plot(
     return fig, XI, YI, ZI, ax
 
 
-def capacity_with_meta(df_env: pd.DataFrame, use_deck: bool, deck_offset: float) -> pd.DataFrame:
-    """
-    Build capacity curve with metadata at 0.01 m radius resolution (rounded to 2 decimals):
-      - For each rounded radius, take the row with MAX Load (keep its angles & height)
-      - Apply non-increasing monotone envelope to SWL (conservative)
-      - Compute distance from hull
-      - Height is deck-referenced if 'use_deck' is True
-    Returns DataFrame with: Radius_m, SWL_t (envelope), MainJib_deg, FoldingJib_deg, Height_m, Distance_from_hull_m
-    """
-    if df_env.empty:
-        return pd.DataFrame(columns=["Radius_m","SWL_t","MainJib_deg","FoldingJib_deg","Height_m","Distance_from_hull_m"])
-
-    df = df_env.copy()
-    df["r_round"] = np.round(df["Outreach"].astype(float), 2)
-
-    # index of row with max Load at each rounded radius
-    idx_max = df.groupby("r_round")["Load"].idxmax()
-    picks = df.loc[idx_max, ["r_round","Load","MainJib","FoldingJib","Height"]].copy()
-    picks = picks.sort_values("r_round").reset_index(drop=True)
-
-    xs = picks["r_round"].astype(float).to_numpy()
-    swl_raw = picks["Load"].astype(float).to_numpy()
-
-    # monotone non-increasing envelope
-    swl_env = swl_raw.copy()
-    for i in range(1, len(swl_env)):
-        swl_env[i] = min(swl_env[i-1], swl_env[i])
-
-    height_disp = picks["Height"].astype(float).to_numpy() + (deck_offset if use_deck else 0.0)
-
-    out = pd.DataFrame({
-        "Radius_m": xs,
-        "SWL_t": swl_env,  # envelope value (used in charts)
-        "MainJib_deg": picks["MainJib"].astype(float).to_numpy(),
-        "FoldingJib_deg": picks["FoldingJib"].astype(float).to_numpy(),
-        "Height_m": height_disp,
-        "Distance_from_hull_m": xs - PEDESTAL_INBOARD_M
-    })
-    return out
-
-
 def capacity_envelope_vs_radius(df_env):
     """
-    (Used for quick Plotly line when no meta is needed.)
-    Round radius to 2 decimals, take max SWL per radius, sort by radius,
-    then enforce non-increasing SWL with radius.
+    Ripple-free envelope:
+    1) Round radius to 2 decimals
+    2) Max SWL per rounded radius
+    3) Sort by radius
+    4) Enforce non-increasing SWL with radius
     """
     if df_env.empty:
         return np.array([]), np.array([])
@@ -145,8 +106,8 @@ def capacity_envelope_vs_radius(df_env):
 
     r_round = np.round(r, 2)
     agg = (pd.DataFrame({"r": r_round, "L": L})
-           .groupby("r", as_index=False)["L"].max()
-           .sort_values("r"))
+             .groupby("r", as_index=False)["L"].max()
+             .sort_values("r"))
 
     xs = agg["r"].to_numpy()
     ys = agg["L"].to_numpy()
@@ -292,11 +253,11 @@ def main():
                                       default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
     with left:
-        # ----- Matplotlib contour (as in your app) -----
         x = df_env["Outreach"].values.astype(float)
         y = (df_env["Height"] + (deck_offset if use_deck else 0.0)).values.astype(float)
         z = df_env["Load"].values.astype(float)
 
+        # Dynamic titles with Environment & Cd
         title_contour = f"Rated Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Rated Capacity - {chosen_env}"
         title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
 
@@ -314,17 +275,14 @@ def main():
             )
             st.pyplot(fig, use_container_width=True)
 
-        # ===== Build capacity with meta once (drives Plotly, Matplotlib, and CSV) =====
-        cap_df = capacity_with_meta(df_env, use_deck=use_deck, deck_offset=deck_offset)
-
-        # ----- Interactive capacity chart (Plotly) -----
+        # ----- Offshore lift capacity chart (Plotly interactive) -----
         st.markdown("### Interactive capacity chart")
-        if not cap_df.empty:
-            xs = cap_df["Radius_m"].to_numpy()
-            ys = cap_df["SWL_t"].to_numpy()
+        xs, ys = capacity_envelope_vs_radius(df_env)
 
+        if len(xs) and len(ys):
             fig2 = go.Figure()
 
+            # Envelope line
             fig2.add_trace(go.Scatter(
                 x=xs, y=ys, mode="lines",
                 name="Envelope",
@@ -344,15 +302,16 @@ def main():
             fig2.add_shape(
                 type="line",
                 x0=PEDESTAL_INBOARD_M, x1=PEDESTAL_INBOARD_M,
-                y0=float(np.nanmin(ys)) if len(ys) else 0, y1=float(np.nanmax(ys)) if len(ys) else 1,
+                y0=min(ys) if len(ys) else 0, y1=max(ys) if len(ys) else 1,
                 line=dict(dash="dash"),
                 xref="x", yref="y"
             )
             fig2.add_annotation(
-                x=PEDESTAL_INBOARD_M, y=float(np.nanmax(ys)) if len(ys) else 0,
+                x=PEDESTAL_INBOARD_M, y=max(ys) if len(ys) else 0,
                 text="Hull side", showarrow=False, yshift=10
             )
 
+            # Layout
             fig2.update_layout(
                 title=title_capacity,
                 xaxis_title="RADIUS (m)",
@@ -368,30 +327,7 @@ def main():
                 "modeBarButtonsToRemove": ["lasso2d"]
             })
 
-            # ----- Static print chart (Matplotlib), as per your original -----
-            st.markdown("### Print chart")
-            fig3, ax3 = plt.subplots(figsize=(8, 4.5))
-            ax3.plot(xs, ys, linewidth=2.0, label="Envelope")
-            # Hull side guideline
-            ax3.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
-            ax3.text(PEDESTAL_INBOARD_M, ax3.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
-            # Current point marker
-            if np.isfinite(ox) and np.isfinite(rated):
-                ax3.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red",
-                         markeredgecolor="red", linestyle="None", label="Current point")
-            ax3.set_xlabel("RADIUS (m)")
-            ax3.set_ylabel("SWL (t)")
-            ax3.set_title(title_capacity)
-            ax3.grid(True, alpha=0.3)
-            ax3.legend(loc="best")
-            st.pyplot(fig3, use_container_width=True)
-
-            # ----- CSV download with angles + height + distance from hull -----
-            # Keep original columns + add metadata
-            env_csv = cap_df[[
-                "Radius_m", "SWL_t", "MainJib_deg", "FoldingJib_deg", "Height_m", "Distance_from_hull_m"
-            ]].copy()
-
+            env_csv = pd.DataFrame({"Radius_m": xs, "SWL_t": ys})
             st.download_button(
                 "Download capacity curve CSV",
                 env_csv.to_csv(index=False).encode("utf-8"),
