@@ -64,7 +64,6 @@ def contour_plot(
     fig, ax = plt.subplots(figsize=(8, 7))
     hm = ax.contourf(XI, YI, ZI, levels=levels, vmin=vmin, vmax=vmax)
 
-    # Single iso-load overlay with label
     if target is not None:
         try:
             cs = ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
@@ -72,7 +71,6 @@ def contour_plot(
         except Exception:
             pass
 
-    # Hull side guideline
     ax.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
     ax.text(PEDESTAL_INBOARD_M, ax.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
 
@@ -90,55 +88,55 @@ def contour_plot(
     return fig, XI, YI, ZI, ax
 
 
-def capacity_table_with_meta(df_env: pd.DataFrame, deck_offset: float, use_deck: bool) -> pd.DataFrame:
-    """
-    Build a per-radius table carrying meta info (angles & height), plus a monotone SWL envelope.
+def round_to_step(values: np.ndarray, step: float) -> np.ndarray:
+    # Robust, step can be 0.01, 0.05, 0.10 etc.
+    if step <= 0:
+        return values
+    return np.round(values / step) * step
 
-    Steps:
-    - Round radius to 2 decimals
-    - For each rounded radius, pick the row with MAX Load (keep its MainJib/FoldingJib/Height)
-    - Sort by radius
-    - Compute a non-increasing envelope SWL_monotone by forward pass: SWL_mono[i] = min(SWL_mono[i-1], SWL_raw[i])
-    - Compute Distance_from_hull
-    - Provide Height_display consistent with the UI choice (deck-referenced or raw)
+
+def capacity_table_with_meta(df_env: pd.DataFrame, deck_offset: float, use_deck: bool, radius_step: float) -> pd.DataFrame:
     """
+    Build a per-radius table with meta info (angles & height) and both RAW and MONOTONE SWL.
+    - Bin radius by 'radius_step' (m), pick MAX Load within each bin (keep its angles & height)
+    - Sort by radius
+    - Compute non-increasing envelope SWL_monotone (forward pass)
+    - Include Distance_from_hull and Height (deck-referenced if selected)
+    """
+    cols = ["Radius_m","SWL_raw_t","SWL_monotone_t","MainJib_deg","FoldingJib_deg","Height_m","Distance_from_hull_m","Radius_step_m"]
     if df_env.empty:
-        return pd.DataFrame(columns=[
-            "Radius_m","SWL_raw_t","SWL_monotone_t","MainJib_deg","FoldingJib_deg",
-            "Height_m","Distance_from_hull_m"
-        ])
+        return pd.DataFrame(columns=cols)
 
     df = df_env.copy()
-    df["r_round"] = np.round(df["Outreach"].astype(float), 2)
+    df["r_bin"] = round_to_step(df["Outreach"].astype(float).to_numpy(), radius_step)
 
-    # idx of rows with max Load inside each rounded-radius bin
-    idx_max = df.groupby("r_round")["Load"].idxmax()
-    picks = df.loc[idx_max, ["r_round","Load","MainJib","FoldingJib","Height"]].copy()
+    # pick row with MAX load per bin (keep that row's angles and height)
+    idx_max = df.groupby("r_bin")["Load"].idxmax()
+    picks = df.loc[idx_max, ["r_bin","Load","MainJib","FoldingJib","Height"]].copy().sort_values("r_bin")
 
-    picks = picks.sort_values("r_round").reset_index(drop=True)
-
-    # Height_display according to deck reference choice
+    # height display
     height_display = picks["Height"].astype(float) + (deck_offset if use_deck else 0.0)
 
     out = pd.DataFrame({
-        "Radius_m": picks["r_round"].astype(float).to_numpy(),
+        "Radius_m": picks["r_bin"].astype(float).to_numpy(),
         "SWL_raw_t": picks["Load"].astype(float).to_numpy(),
         "MainJib_deg": picks["MainJib"].astype(float).to_numpy(),
         "FoldingJib_deg": picks["FoldingJib"].astype(float).to_numpy(),
-        "Height_m": height_display.astype(float).to_numpy()
+        "Height_m": height_display.astype(float).to_numpy(),
     })
 
-    # Monotone (non-increasing) envelope
-    swl = out["SWL_raw_t"].to_numpy().copy()
-    swl_mono = swl.copy()
+    # monotone envelope
+    swl_raw = out["SWL_raw_t"].to_numpy().copy()
+    swl_mono = swl_raw.copy()
     for i in range(1, len(swl_mono)):
         swl_mono[i] = min(swl_mono[i-1], swl_mono[i])
     out["SWL_monotone_t"] = swl_mono
 
-    # Distance from hull
+    # distance from hull
     out["Distance_from_hull_m"] = out["Radius_m"] - PEDESTAL_INBOARD_M
+    out["Radius_step_m"] = radius_step
 
-    return out[["Radius_m","SWL_raw_t","SWL_monotone_t","MainJib_deg","FoldingJib_deg","Height_m","Distance_from_hull_m"]]
+    return out[["Radius_m","SWL_raw_t","SWL_monotone_t","MainJib_deg","FoldingJib_deg","Height_m","Distance_from_hull_m","Radius_step_m"]]
 
 
 def synced_slider_number(label, key_base, min_val, max_val, default, step=0.01, fmt="%.2f"):
@@ -168,7 +166,6 @@ def synced_slider_number(label, key_base, min_val, max_val, default, step=0.01, 
 
 @st.cache_data
 def estimate_geometry(df_subset: pd.DataFrame):
-    # Folding angle is ALWAYS treated as relative to main angle
     thetas1 = np.deg2rad(df_subset["MainJib"].values.astype(float))
     thetas2 = np.deg2rad((df_subset["MainJib"] + df_subset["FoldingJib"]).values.astype(float))
 
@@ -251,88 +248,77 @@ def main():
         deck_offset = st.number_input("Deck offset [m] (positive if deck is below bearing)", value=6.0, step=0.1, format="%.1f")
 
         hz = hz_raw + (deck_offset if use_deck else 0.0)
-
-        # Distance from hull
         dist_from_hull = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
 
         k1, k2 = st.columns(2)
         with k1:
-            st.text("Radius [m]")
-            st.header(f"{ox:.2f}" if np.isfinite(ox) else "-")
-            st.text("Rated load [t]")
-            st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
+            st.text("Radius [m]");        st.header(f"{ox:.2f}" if np.isfinite(ox) else "-")
+            st.text("Rated load [t]");    st.header(f"{rated:.1f}" if np.isfinite(rated) else "-")
             st.text("Distance from hull [m]")
             if np.isfinite(dist_from_hull) and dist_from_hull < 0:
                 st.markdown(f"<h3 style='color:#cc0000'>{dist_from_hull:.2f}</h3>", unsafe_allow_html=True)
             else:
                 st.header(f"{dist_from_hull:.2f}" if np.isfinite(dist_from_hull) else "-")
         with k2:
-            st.text(("Height above deck [m]" if use_deck else "Height [m]"))
-            st.header(f"{hz:.2f}" if np.isfinite(hz) else "-")
-            st.text("DAF")
-            st.header(f"{daf:.2f}" if np.isfinite(daf) else "-")
+            st.text(("Height above deck [m]" if use_deck else "Height [m]"));  st.header(f"{hz:.2f}" if np.isfinite(hz) else "-")
+            st.text("DAF");                                                    st.header(f"{daf:.2f}" if np.isfinite(daf) else "-")
 
-        # Iso-load overlay control (value is also printed on the contour line in the chart)
         minL, maxL = float(df_env["Load"].min()), float(df_env["Load"].max())
         target = synced_slider_number("Iso-load [t] (overlay)", "iso_load", minL, maxL,
                                       default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
+        st.markdown("#### Capacity curve options")
+        radius_step = st.select_slider(
+            "Radius rounding (bin size)",
+            options=[0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00],
+            value=0.02,
+            format_func=lambda v: f"{v:.2f} m"
+        )
+
     with left:
-        # ----- Matplotlib contour (as before) -----
+        # ----- Contour (Matplotlib) -----
         x = df_env["Outreach"].values.astype(float)
         y = (df_env["Height"] + (deck_offset if use_deck else 0.0)).values.astype(float)
         z = df_env["Load"].values.astype(float)
 
         title_contour = f"Rated Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Rated Capacity - {chosen_env}"
-        fig, XI, YI, ZI, ax = contour_plot(
-            x, y, z,
-            target=target,
-            marker=(ox, hz),
-            title=title_contour
-        )
+        fig, XI, YI, ZI, ax = contour_plot(x, y, z, target=target, marker=(ox, hz), title=title_contour)
         if fig is not None:
-            draw_crane_aligned(
-                ax, main_angle, fold_angle,
-                base_offset_y=(deck_offset if use_deck else 0.0),
-                df_env=df_env, hook_target=(ox, hz), color="white"
-            )
+            draw_crane_aligned(ax, main_angle, fold_angle, base_offset_y=(deck_offset if use_deck else 0.0),
+                               df_env=df_env, hook_target=(ox, hz), color="white")
             st.pyplot(fig, use_container_width=True)
 
-        # ----- Build Capacity Table (with meta + distance) -----
+        # ----- Capacity table (with options) -----
         st.markdown("### Interactive capacity chart")
-        cap_table = capacity_table_with_meta(df_env, deck_offset=deck_offset, use_deck=use_deck)
+        cap_table = capacity_table_with_meta(df_env, deck_offset=deck_offset, use_deck=use_deck, radius_step=radius_step)
 
         if not cap_table.empty:
             xs = cap_table["Radius_m"].to_numpy()
+            ys_raw  = cap_table["SWL_raw_t"].to_numpy()
             ys_mono = cap_table["SWL_monotone_t"].to_numpy()
 
-            # Distances for hover
-            dist_from_hull_all = cap_table["Distance_from_hull_m"].to_numpy()
-            dist_point = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
+            # Diagnostics: how many bins adjusted by monotone?
+            adjusted = int(np.sum(ys_mono < ys_raw))
+            total_bins = int(len(ys_raw))
 
-            # Extra meta for hover (angles & height)
-            main_j = cap_table["MainJib_deg"].to_numpy()
-            fold_j = cap_table["FoldingJib_deg"].to_numpy()
-            h_disp = cap_table["Height_m"].to_numpy()
-            swl_raw = cap_table["SWL_raw_t"].to_numpy()
+            # Distances + meta for hover
+            dist_all = cap_table["Distance_from_hull_m"].to_numpy()
+            main_j  = cap_table["MainJib_deg"].to_numpy()
+            fold_j  = cap_table["FoldingJib_deg"].to_numpy()
+            h_disp  = cap_table["Height_m"].to_numpy()
 
-            # Build customdata: [dist, main, folding, height, swl_raw]
-            custom = np.stack((dist_from_hull_all, main_j, fold_j, h_disp, swl_raw), axis=-1)
-
-            # ===== Plotly interactive =====
+            # Plotly interactive
             fig2 = go.Figure()
 
-            # Envelope line (monotone)
+            # RAW (max per bin) - dashed
             fig2.add_trace(go.Scatter(
-                x=xs,
-                y=ys_mono,
-                mode="lines",
-                name="Envelope (monotone)",
-                customdata=custom,
+                x=xs, y=ys_raw, mode="lines",
+                name=f"RAW (max/bin={radius_step:.2f} m)",
+                line=dict(dash="dot"),
+                customdata=np.stack((dist_all, main_j, fold_j, h_disp), axis=-1),
                 hovertemplate=(
                     "Radius: %{x:.2f} m<br>"
-                    "SWL (env): %{y:.2f} t<br>"
-                    "SWL (raw @r): %{customdata[4]:.2f} t<br>"
+                    "SWL (raw): %{y:.2f} t<br>"
                     "Dist. from hull: %{customdata[0]:.2f} m<br>"
                     "MainJib: %{customdata[1]:.2f}°<br>"
                     "FoldingJib: %{customdata[2]:.2f}°<br>"
@@ -340,15 +326,28 @@ def main():
                 ),
             ))
 
-            # Current point marker (if available)
+            # Monotone envelope - solid
+            fig2.add_trace(go.Scatter(
+                x=xs, y=ys_mono, mode="lines",
+                name="Envelope (monotone)",
+                customdata=np.stack((dist_all, main_j, fold_j, h_disp), axis=-1),
+                hovertemplate=(
+                    "Radius: %{x:.2f} m<br>"
+                    "SWL (env): %{y:.2f} t<br>"
+                    "Dist. from hull: %{customdata[0]:.2f} m<br>"
+                    "MainJib: %{customdata[1]:.2f}°<br>"
+                    "FoldingJib: %{customdata[2]:.2f}°<br>"
+                    "Height: %{customdata[3]:.2f} m<extra></extra>"
+                ),
+            ))
+
+            # Current point marker
             if np.isfinite(ox) and np.isfinite(rated):
                 fig2.add_trace(go.Scatter(
-                    x=[ox],
-                    y=[rated],
-                    mode="markers",
+                    x=[ox], y=[rated], mode="markers",
                     name="Current point",
                     marker=dict(size=10, color="red"),
-                    customdata=[[dist_point, main_angle, fold_angle, hz, rated]],
+                    customdata=[[ox - PEDESTAL_INBOARD_M, main_angle, fold_angle, hz]],
                     hovertemplate=(
                         "Current point<br>"
                         "Radius: %{x:.2f} m<br>"
@@ -361,21 +360,11 @@ def main():
                 ))
 
             # Hull side vertical guide
-            fig2.add_shape(
-                type="line",
-                x0=PEDESTAL_INBOARD_M, x1=PEDESTAL_INBOARD_M,
-                y0=float(np.nanmin(ys_mono)) if len(ys_mono) else 0,
-                y1=float(np.nanmax(ys_mono)) if len(ys_mono) else 1,
-                line=dict(dash="dash"),
-                xref="x", yref="y"
-            )
-            fig2.add_annotation(
-                x=PEDESTAL_INBOARD_M,
-                y=float(np.nanmax(ys_mono)) if len(ys_mono) else 0,
-                text="Hull side",
-                showarrow=False,
-                yshift=10
-            )
+            y0 = float(np.nanmin(np.concatenate([ys_raw, ys_mono]))) if total_bins else 0.0
+            y1 = float(np.nanmax(np.concatenate([ys_raw, ys_mono]))) if total_bins else 1.0
+            fig2.add_shape(type="line", x0=PEDESTAL_INBOARD_M, x1=PEDESTAL_INBOARD_M, y0=y0, y1=y1,
+                           line=dict(dash="dash"), xref="x", yref="y")
+            fig2.add_annotation(x=PEDESTAL_INBOARD_M, y=y1, text="Hull side", showarrow=False, yshift=10)
 
             title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
             fig2.update_layout(
@@ -387,41 +376,28 @@ def main():
                 template="plotly_white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
+            st.plotly_chart(fig2, use_container_width=True, config={"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d"]})
 
-            st.plotly_chart(fig2, use_container_width=True, config={
-                "displaylogo": False,
-                "modeBarButtonsToRemove": ["lasso2d"]
-            })
-
-            # ===== Matplotlib capacity print chart (with red marker) =====
+            # Matplotlib print chart: Envelope solid, RAW dashed + red marker
             st.markdown("### Print chart (Matplotlib)")
             fig3, ax3 = plt.subplots(figsize=(8, 4.5))
-            ax3.plot(xs, ys_mono, linewidth=2.0, label="Envelope (monotone)")
-            # Hull side guideline
+            ax3.plot(xs, ys_raw, linewidth=1.4, linestyle="--", label=f"RAW (bin={radius_step:.2f} m)")
+            ax3.plot(xs, ys_mono, linewidth=2.2, label="Envelope (monotone)")
             ax3.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
             ax3.text(PEDESTAL_INBOARD_M, ax3.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
-            # Current point marker
             if np.isfinite(ox) and np.isfinite(rated):
-                ax3.plot([ox], [rated], marker="o", markersize=8,
-                         markerfacecolor="red", markeredgecolor="red",
-                         linestyle="None", label="Current point")
-            ax3.set_xlabel("RADIUS (m)")
-            ax3.set_ylabel("SWL (t)")
-            ax3.set_title(title_capacity)
-            ax3.grid(True, alpha=0.3)
-            ax3.legend(loc="best")
+                ax3.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red", markeredgecolor="red", linestyle="None", label="Current point")
+            ax3.set_xlabel("RADIUS (m)"); ax3.set_ylabel("SWL (t)"); ax3.set_title(title_capacity)
+            ax3.grid(True, alpha=0.3); ax3.legend(loc="best")
             st.pyplot(fig3, use_container_width=True)
 
-            # ===== Enriched CSV (angles + height + distance + raw vs monotone SWL) =====
-            env_csv = cap_table.rename(columns={
-                "Radius_m": "Radius_m",
-                "SWL_raw_t": "SWL_raw_t",
-                "SWL_monotone_t": "SWL_monotone_t",
-                "MainJib_deg": "MainJib_deg",
-                "FoldingJib_deg": "FoldingJib_deg",
-                "Height_m": "Height_m",
-                "Distance_from_hull_m": "Distance_from_hull_m",
-            })
+            # Diagnostics
+            with st.expander("Diagnostics"):
+                st.write(f"Bins: {total_bins} | Adjusted by monotone rule: {adjusted} ({(adjusted/max(total_bins,1))*100:.1f}%)")
+                st.dataframe(cap_table.head(12))
+
+            # CSV (includes distance from hull, angles, height, RAW & envelope, bin size)
+            env_csv = cap_table.copy()
             st.download_button(
                 "Download capacity curve CSV",
                 env_csv.to_csv(index=False).encode("utf-8"),
