@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.tri import Triangulation, LinearTriInterpolator
-import plotly.graph_objects as go
+import plotly.graph_objects as go  # <-- NEW
 
 st.set_page_config(page_title="Crane Curve Viewer", layout="wide")
 
@@ -32,6 +32,62 @@ def nearest_point(df, fold_angle, main_angle):
     idx = ((df["FoldingJib"] - fold_angle).abs() + (df["MainJib"] - main_angle).abs()).idxmin()
     row = df.loc[idx]
     return float(row["Outreach"]), float(row["Height"]), float(row["Load"])
+
+
+def contour_plot(
+    x, y, z, target=None, marker=None, show_colorbar=True,
+    title="Rated capacity related to height and radius",
+    nlevels=20
+):
+    if len(x) < 3 or len(y) < 3:
+        st.warning("Not enough points to build contour.")
+        return None, None, None, None, None
+    if len(np.unique(x)) < 3 or len(np.unique(y)) < 3:
+        st.warning("Not enough unique (Outreach, Height) points to build contour.")
+        return None, None, None, None, None
+
+    tri = Triangulation(x, y)
+    interp = LinearTriInterpolator(tri, z)
+
+    n = 400
+    xi = np.linspace(np.min(x), np.max(x), n)
+    yi = np.linspace(np.min(y), np.max(y), n)
+    XI, YI = np.meshgrid(xi, yi)
+    ZI = interp(XI, YI)
+
+    vmin = np.nanmin(z)
+    vmax = np.nanmax(z)
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+    levels = np.linspace(vmin, vmax, nlevels)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    hm = ax.contourf(XI, YI, ZI, levels=levels, vmin=vmin, vmax=vmax)
+
+    # Single iso-load overlay with label
+    if target is not None:
+        try:
+            cs = ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
+            ax.clabel(cs, fmt=lambda v: f"{v:.1f} t", inline=True, fontsize=10)
+        except Exception:
+            pass
+
+    # Hull side guideline
+    ax.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
+    ax.text(PEDESTAL_INBOARD_M, ax.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
+
+    if marker is not None and all(np.isfinite(marker)):
+        ox, hz = marker
+        ax.plot([ox], [hz], marker="o", markersize=7, markerfacecolor="red", markeredgecolor="red")
+
+    ax.set_xlabel("y Radius [m]")
+    ax.set_ylabel("z Height [m]")
+    ax.set_title(title)
+
+    if show_colorbar:
+        cbar = fig.colorbar(hm, ax=ax, shrink=0.9)
+        cbar.set_label("Load [t]")
+    return fig, XI, YI, ZI, ax
 
 
 def capacity_envelope_vs_radius(df_env):
@@ -108,116 +164,30 @@ def elbow_point(main_deg, x0, y0, L1):
     return (x0 + L1*np.cos(t1), y0 + L1*np.sin(t1))
 
 
-def build_plotly_contour(df_env, deck_offset, use_deck, target, main_angle, fold_angle, daf, chosen_env, ox, hz):
-    # Build dense grid via triangulation, then render with Plotly
-    x = df_env["Outreach"].values.astype(float)
-    y = (df_env["Height"] + (deck_offset if use_deck else 0.0)).values.astype(float)
-    z = df_env["Load"].values.astype(float)
-
-    if len(x) < 3 or len(np.unique(x)) < 3 or len(np.unique(y)) < 3:
-        return None
-
-    tri = Triangulation(x, y)
-    interp = LinearTriInterpolator(tri, z)
-
-    n = 400
-    xi = np.linspace(np.nanmin(x), np.nanmax(x), n)
-    yi = np.linspace(np.nanmin(y), np.nanmax(y), n)
-    XI, YI = np.meshgrid(xi, yi)
-    ZI = interp(XI, YI)
-
-    vmin = float(np.nanmin(z))
-    vmax = float(np.nanmax(z))
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
-
-    title_contour = f"Rated Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Rated Capacity - {chosen_env}"
-
-    fig = go.Figure()
-
-    # Filled contour (surface)
-    fig.add_trace(go.Contour(
-        x=xi, y=yi, z=ZI,
-        ncontours=20,
-        colorscale="Viridis",
-        contours=dict(coloring="heatmap"),
-        colorbar=dict(title="Load [t]"),
-        hovertemplate="Radius: %{x:.2f} m<br>Height: %{y:.2f} m<br>Load: %{z:.2f} t<extra></extra>"
-    ))
-
-    # Single iso-load overlay with label
-    if target is not None and np.isfinite(target):
-        fig.add_trace(go.Contour(
-            x=xi, y=yi, z=ZI,
-            contours=dict(start=target, end=target, size=1e-9, coloring="lines", showlabels=True,
-                          labelfont=dict(size=12)),
-            showscale=False,
-            line=dict(width=2),
-            hoverinfo="skip",
-            name=f"Iso-load {target:.1f} t"
-        ))
-
-    # Crane overlay (as shapes)
+def draw_crane_aligned(ax, main_deg, fold_deg, base_offset_y, df_env, hook_target=None, color="white"):
     try:
         x0, y0, L1, L2 = estimate_geometry(df_env[["MainJib","FoldingJib","Outreach","Height"]])
     except Exception:
         x0, y0, L1, L2 = 0.0, 0.0, 10.0, 10.0
-    y0 = y0 + (deck_offset if use_deck else 0.0)
 
-    ex, ey = elbow_point(main_angle, x0, y0, L1)
+    y0 = y0 + base_offset_y
+
+    ex, ey = elbow_point(main_deg, x0, y0, L1)
+    bx, by = x0, y0
 
     size = max(L1, L2) * 0.04
-    base_rect = dict(type="rect",
-                     x0=x0 - size, x1=x0 + size, y0=y0 - size, y1=y0 + size,
-                     line=dict(width=1.5), fillcolor="rgba(0,0,0,0)")
+    rect_x = [bx - size, bx + size, bx + size, bx - size, bx - size]
+    rect_y = [by - size, by - size, by + size, by + size, by - size]
+    ax.plot(rect_x, rect_y, color=color, linewidth=1.5)
 
-    main_link = dict(type="line", x0=x0, y0=y0, x1=ex, y1=ey, line=dict(width=2))
-    hook_link = dict(type="line", x0=ex, y0=ey, x1=float(ox) if np.isfinite(ox) else ex,
-                     y1=float(hz) if np.isfinite(hz) else ey, line=dict(width=2))
+    ax.plot([bx, ex], [by, ey], color=color, linewidth=2.0)
+    ax.plot(bx, by, "o", color=color, markersize=4)
+    ax.plot(ex, ey, "o", color=color, markersize=4)
 
-    # Hull side guideline
-    hull_line = dict(type="line",
-                     x0=PEDESTAL_INBOARD_M, x1=PEDESTAL_INBOARD_M,
-                     y0=float(np.nanmin(yi)), y1=float(np.nanmax(yi)),
-                     line=dict(width=1.2, dash="dash"))
-
-    shapes = [base_rect, main_link, hook_link, hull_line]
-    fig.update_layout(shapes=shapes)
-
-    # Add joints + hook as scatter markers
-    scatter_pts_x = [x0, ex]
-    scatter_pts_y = [y0, ey]
-    fig.add_trace(go.Scatter(
-        x=scatter_pts_x, y=scatter_pts_y, mode="markers",
-        marker=dict(size=6),
-        name="Crane joints",
-        hovertemplate="x: %{x:.2f} m<br>y: %{y:.2f} m<extra></extra>"
-    ))
-
-    if np.isfinite(ox) and np.isfinite(hz):
-        fig.add_trace(go.Scatter(
-            x=[ox], y=[hz], mode="markers",
-            marker=dict(size=9),
-            name="Hook position",
-            hovertemplate="Hook<br>Radius: %{x:.2f} m<br>Height: %{y:.2f} m<extra></extra>"
-        ))
-
-    # Hull side label
-    fig.add_annotation(
-        x=PEDESTAL_INBOARD_M, y=float(np.nanmax(yi)),
-        text="Hull side", showarrow=False, yshift=10
-    )
-
-    fig.update_layout(
-        title=title_contour,
-        xaxis_title="y Radius [m]",
-        yaxis_title="z Height [m]",
-        template="plotly_white",
-        hovermode="closest",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-
-    return fig
+    if hook_target is not None and all(np.isfinite(hook_target)):
+        hx, hy = hook_target
+        ax.plot([ex, hx], [ey, hy], color=color, linewidth=2.0)
+        ax.plot(hx, hy, "o", color=color, markersize=4)
 
 
 def main():
@@ -283,22 +253,29 @@ def main():
                                       default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
     with left:
-        # ---- INTERACTIVE PLOTLY CONTOUR ----
-        fig_contour = build_plotly_contour(
-            df_env=df_env,
-            deck_offset=deck_offset,
-            use_deck=use_deck,
-            target=target,
-            main_angle=main_angle,
-            fold_angle=fold_angle,
-            daf=daf,
-            chosen_env=chosen_env,
-            ox=ox, hz=hz
-        )
-        if fig_contour is not None:
-            st.plotly_chart(fig_contour, use_container_width=True, config={"displaylogo": False})
+        x = df_env["Outreach"].values.astype(float)
+        y = (df_env["Height"] + (deck_offset if use_deck else 0.0)).values.astype(float)
+        z = df_env["Load"].values.astype(float)
 
-        # ---- INTERACTIVE CAPACITY (Plotly) ----
+        # Dynamic titles with Environment & Cd
+        title_contour = f"Rated Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Rated Capacity - {chosen_env}"
+        title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
+
+        fig, XI, YI, ZI, ax = contour_plot(
+            x, y, z,
+            target=target,
+            marker=(ox, hz),
+            title=title_contour
+        )
+        if fig is not None:
+            draw_crane_aligned(
+                ax, main_angle, fold_angle,
+                base_offset_y=(deck_offset if use_deck else 0.0),
+                df_env=df_env, hook_target=(ox, hz), color="white"
+            )
+            st.pyplot(fig, use_container_width=True)
+
+        # ----- Offshore lift capacity chart (Plotly interactive) -----
         st.markdown("### Interactive capacity chart")
         xs, ys = capacity_envelope_vs_radius(df_env)
 
@@ -334,7 +311,7 @@ def main():
                 text="Hull side", showarrow=False, yshift=10
             )
 
-            title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
+            # Layout
             fig2.update_layout(
                 title=title_capacity,
                 xaxis_title="RADIUS (m)",
