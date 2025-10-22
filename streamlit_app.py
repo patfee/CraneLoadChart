@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.tri import Triangulation, LinearTriInterpolator
-import plotly.graph_objects as go  # <-- NEW
+import plotly.graph_objects as go  # Plotly for interactive capacity chart
 
 st.set_page_config(page_title="Crane Curve Viewer", layout="wide")
 
@@ -90,30 +90,55 @@ def contour_plot(
     return fig, XI, YI, ZI, ax
 
 
-def capacity_envelope_vs_radius(df_env):
+def capacity_table_with_meta(df_env: pd.DataFrame, deck_offset: float, use_deck: bool) -> pd.DataFrame:
     """
-    Ripple-free envelope:
-    1) Round radius to 2 decimals
-    2) Max SWL per rounded radius
-    3) Sort by radius
-    4) Enforce non-increasing SWL with radius
+    Build a per-radius table carrying meta info (angles & height), plus a monotone SWL envelope.
+
+    Steps:
+    - Round radius to 2 decimals
+    - For each rounded radius, pick the row with MAX Load (keep its MainJib/FoldingJib/Height)
+    - Sort by radius
+    - Compute a non-increasing envelope SWL_monotone by forward pass: SWL_mono[i] = min(SWL_mono[i-1], SWL_raw[i])
+    - Compute Distance_from_hull
+    - Provide Height_display consistent with the UI choice (deck-referenced or raw)
     """
     if df_env.empty:
-        return np.array([]), np.array([])
+        return pd.DataFrame(columns=[
+            "Radius_m","SWL_raw_t","SWL_monotone_t","MainJib_deg","FoldingJib_deg",
+            "Height_m","Distance_from_hull_m"
+        ])
 
-    r = df_env["Outreach"].to_numpy(dtype=float)
-    L = df_env["Load"].to_numpy(dtype=float)
+    df = df_env.copy()
+    df["r_round"] = np.round(df["Outreach"].astype(float), 2)
 
-    r_round = np.round(r, 2)
-    agg = (pd.DataFrame({"r": r_round, "L": L})
-             .groupby("r", as_index=False)["L"].max()
-             .sort_values("r"))
+    # idx of rows with max Load inside each rounded-radius bin
+    idx_max = df.groupby("r_round")["Load"].idxmax()
+    picks = df.loc[idx_max, ["r_round","Load","MainJib","FoldingJib","Height"]].copy()
 
-    xs = agg["r"].to_numpy()
-    ys = agg["L"].to_numpy()
+    picks = picks.sort_values("r_round").reset_index(drop=True)
 
-    ys = np.maximum.accumulate(ys[::-1])[::-1]
-    return xs, ys
+    # Height_display according to deck reference choice
+    height_display = picks["Height"].astype(float) + (deck_offset if use_deck else 0.0)
+
+    out = pd.DataFrame({
+        "Radius_m": picks["r_round"].astype(float).to_numpy(),
+        "SWL_raw_t": picks["Load"].astype(float).to_numpy(),
+        "MainJib_deg": picks["MainJib"].astype(float).to_numpy(),
+        "FoldingJib_deg": picks["FoldingJib"].astype(float).to_numpy(),
+        "Height_m": height_display.astype(float).to_numpy()
+    })
+
+    # Monotone (non-increasing) envelope
+    swl = out["SWL_raw_t"].to_numpy().copy()
+    swl_mono = swl.copy()
+    for i in range(1, len(swl_mono)):
+        swl_mono[i] = min(swl_mono[i-1], swl_mono[i])
+    out["SWL_monotone_t"] = swl_mono
+
+    # Distance from hull
+    out["Distance_from_hull_m"] = out["Radius_m"] - PEDESTAL_INBOARD_M
+
+    return out[["Radius_m","SWL_raw_t","SWL_monotone_t","MainJib_deg","FoldingJib_deg","Height_m","Distance_from_hull_m"]]
 
 
 def synced_slider_number(label, key_base, min_val, max_val, default, step=0.01, fmt="%.2f"):
@@ -253,14 +278,12 @@ def main():
                                       default=(minL + maxL) / 2, step=0.1, fmt="%.1f")
 
     with left:
+        # ----- Matplotlib contour (as before) -----
         x = df_env["Outreach"].values.astype(float)
         y = (df_env["Height"] + (deck_offset if use_deck else 0.0)).values.astype(float)
         z = df_env["Load"].values.astype(float)
 
-        # Dynamic titles with Environment & Cd
         title_contour = f"Rated Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Rated Capacity - {chosen_env}"
-        title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
-
         fig, XI, YI, ZI, ax = contour_plot(
             x, y, z,
             target=target,
@@ -275,48 +298,91 @@ def main():
             )
             st.pyplot(fig, use_container_width=True)
 
-        # ----- Offshore lift capacity chart (Plotly interactive) -----
+        # ----- Build Capacity Table (with meta + distance) -----
         st.markdown("### Interactive capacity chart")
-        xs, ys = capacity_envelope_vs_radius(df_env)
+        cap_table = capacity_table_with_meta(df_env, deck_offset=deck_offset, use_deck=use_deck)
 
-        if len(xs) and len(ys):
+        if not cap_table.empty:
+            xs = cap_table["Radius_m"].to_numpy()
+            ys_mono = cap_table["SWL_monotone_t"].to_numpy()
+
+            # Distances for hover
+            dist_from_hull_all = cap_table["Distance_from_hull_m"].to_numpy()
+            dist_point = ox - PEDESTAL_INBOARD_M if np.isfinite(ox) else np.nan
+
+            # Extra meta for hover (angles & height)
+            main_j = cap_table["MainJib_deg"].to_numpy()
+            fold_j = cap_table["FoldingJib_deg"].to_numpy()
+            h_disp = cap_table["Height_m"].to_numpy()
+            swl_raw = cap_table["SWL_raw_t"].to_numpy()
+
+            # Build customdata: [dist, main, folding, height, swl_raw]
+            custom = np.stack((dist_from_hull_all, main_j, fold_j, h_disp, swl_raw), axis=-1)
+
+            # ===== Plotly interactive =====
             fig2 = go.Figure()
 
-            # Envelope line
+            # Envelope line (monotone)
             fig2.add_trace(go.Scatter(
-                x=xs, y=ys, mode="lines",
-                name="Envelope",
-                hovertemplate="Radius: %{x:.2f} m<br>SWL: %{y:.2f} t<extra></extra>"
+                x=xs,
+                y=ys_mono,
+                mode="lines",
+                name="Envelope (monotone)",
+                customdata=custom,
+                hovertemplate=(
+                    "Radius: %{x:.2f} m<br>"
+                    "SWL (env): %{y:.2f} t<br>"
+                    "SWL (raw @r): %{customdata[4]:.2f} t<br>"
+                    "Dist. from hull: %{customdata[0]:.2f} m<br>"
+                    "MainJib: %{customdata[1]:.2f}°<br>"
+                    "FoldingJib: %{customdata[2]:.2f}°<br>"
+                    "Height: %{customdata[3]:.2f} m<extra></extra>"
+                ),
             ))
 
             # Current point marker (if available)
             if np.isfinite(ox) and np.isfinite(rated):
                 fig2.add_trace(go.Scatter(
-                    x=[ox], y=[rated], mode="markers",
+                    x=[ox],
+                    y=[rated],
+                    mode="markers",
                     name="Current point",
-                    marker=dict(size=10),
-                    hovertemplate="Current point<br>Radius: %{x:.2f} m<br>SWL: %{y:.2f} t<extra></extra>"
+                    marker=dict(size=10, color="red"),
+                    customdata=[[dist_point, main_angle, fold_angle, hz, rated]],
+                    hovertemplate=(
+                        "Current point<br>"
+                        "Radius: %{x:.2f} m<br>"
+                        "SWL: %{y:.2f} t<br>"
+                        "Dist. from hull: %{customdata[0]:.2f} m<br>"
+                        "MainJib: %{customdata[1]:.2f}°<br>"
+                        "FoldingJib: %{customdata[2]:.2f}°<br>"
+                        "Height: %{customdata[3]:.2f} m<extra></extra>"
+                    ),
                 ))
 
             # Hull side vertical guide
             fig2.add_shape(
                 type="line",
                 x0=PEDESTAL_INBOARD_M, x1=PEDESTAL_INBOARD_M,
-                y0=min(ys) if len(ys) else 0, y1=max(ys) if len(ys) else 1,
+                y0=float(np.nanmin(ys_mono)) if len(ys_mono) else 0,
+                y1=float(np.nanmax(ys_mono)) if len(ys_mono) else 1,
                 line=dict(dash="dash"),
                 xref="x", yref="y"
             )
             fig2.add_annotation(
-                x=PEDESTAL_INBOARD_M, y=max(ys) if len(ys) else 0,
-                text="Hull side", showarrow=False, yshift=10
+                x=PEDESTAL_INBOARD_M,
+                y=float(np.nanmax(ys_mono)) if len(ys_mono) else 0,
+                text="Hull side",
+                showarrow=False,
+                yshift=10
             )
 
-            # Layout
+            title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
             fig2.update_layout(
                 title=title_capacity,
                 xaxis_title="RADIUS (m)",
                 yaxis_title="SWL (t)",
-                hovermode="x unified",
+                hovermode="closest",
                 xaxis=dict(rangeslider=dict(visible=True)),
                 template="plotly_white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
@@ -327,7 +393,35 @@ def main():
                 "modeBarButtonsToRemove": ["lasso2d"]
             })
 
-            env_csv = pd.DataFrame({"Radius_m": xs, "SWL_t": ys})
+            # ===== Matplotlib capacity print chart (with red marker) =====
+            st.markdown("### Print chart (Matplotlib)")
+            fig3, ax3 = plt.subplots(figsize=(8, 4.5))
+            ax3.plot(xs, ys_mono, linewidth=2.0, label="Envelope (monotone)")
+            # Hull side guideline
+            ax3.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
+            ax3.text(PEDESTAL_INBOARD_M, ax3.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
+            # Current point marker
+            if np.isfinite(ox) and np.isfinite(rated):
+                ax3.plot([ox], [rated], marker="o", markersize=8,
+                         markerfacecolor="red", markeredgecolor="red",
+                         linestyle="None", label="Current point")
+            ax3.set_xlabel("RADIUS (m)")
+            ax3.set_ylabel("SWL (t)")
+            ax3.set_title(title_capacity)
+            ax3.grid(True, alpha=0.3)
+            ax3.legend(loc="best")
+            st.pyplot(fig3, use_container_width=True)
+
+            # ===== Enriched CSV (angles + height + distance + raw vs monotone SWL) =====
+            env_csv = cap_table.rename(columns={
+                "Radius_m": "Radius_m",
+                "SWL_raw_t": "SWL_raw_t",
+                "SWL_monotone_t": "SWL_monotone_t",
+                "MainJib_deg": "MainJib_deg",
+                "FoldingJib_deg": "FoldingJib_deg",
+                "Height_m": "Height_m",
+                "Distance_from_hull_m": "Distance_from_hull_m",
+            })
             st.download_button(
                 "Download capacity curve CSV",
                 env_csv.to_csv(index=False).encode("utf-8"),
