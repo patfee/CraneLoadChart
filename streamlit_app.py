@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.tri import Triangulation, LinearTriInterpolator
+import plotly.graph_objects as go  # <-- NEW
 
 st.set_page_config(page_title="Crane Curve Viewer", layout="wide")
 
@@ -67,7 +68,6 @@ def contour_plot(
     if target is not None:
         try:
             cs = ax.contour(XI, YI, ZI, levels=[target], linewidths=2.0)
-            # Label the line with "<value> t"
             ax.clabel(cs, fmt=lambda v: f"{v:.1f} t", inline=True, fontsize=10)
         except Exception:
             pass
@@ -275,26 +275,57 @@ def main():
             )
             st.pyplot(fig, use_container_width=True)
 
-        # ----- Offshore lift capacity chart with RED dot + hull guideline -----
-        st.markdown("### Print chart")
+        # ----- Offshore lift capacity chart (Plotly interactive) -----
+        st.markdown("### Interactive capacity chart")
         xs, ys = capacity_envelope_vs_radius(df_env)
 
         if len(xs) and len(ys):
-            fig2, ax2 = plt.subplots(figsize=(8, 4.5))
-            ax2.plot(xs, ys, linewidth=2.0, label="Envelope")
-            # Hull side guideline
-            ax2.axvline(PEDESTAL_INBOARD_M, linestyle="--", linewidth=1.2)
-            ax2.text(PEDESTAL_INBOARD_M, ax2.get_ylim()[1], " Hull side", va="top", ha="left", rotation=90)
-            # Current point marker
+            fig2 = go.Figure()
+
+            # Envelope line
+            fig2.add_trace(go.Scatter(
+                x=xs, y=ys, mode="lines",
+                name="Envelope",
+                hovertemplate="Radius: %{x:.2f} m<br>SWL: %{y:.2f} t<extra></extra>"
+            ))
+
+            # Current point marker (if available)
             if np.isfinite(ox) and np.isfinite(rated):
-                ax2.plot([ox], [rated], marker="o", markersize=8, markerfacecolor="red",
-                         markeredgecolor="red", linestyle="None", label="Current point")
-            ax2.set_xlabel("RADIUS (m)")
-            ax2.set_ylabel("SWL (t)")
-            ax2.set_title(title_capacity)
-            ax2.grid(True, alpha=0.3)
-            ax2.legend(loc="best")
-            st.pyplot(fig2, use_container_width=True)
+                fig2.add_trace(go.Scatter(
+                    x=[ox], y=[rated], mode="markers",
+                    name="Current point",
+                    marker=dict(size=10),
+                    hovertemplate="Current point<br>Radius: %{x:.2f} m<br>SWL: %{y:.2f} t<extra></extra>"
+                ))
+
+            # Hull side vertical guide
+            fig2.add_shape(
+                type="line",
+                x0=PEDESTAL_INBOARD_M, x1=PEDESTAL_INBOARD_M,
+                y0=min(ys) if len(ys) else 0, y1=max(ys) if len(ys) else 1,
+                line=dict(dash="dash"),
+                xref="x", yref="y"
+            )
+            fig2.add_annotation(
+                x=PEDESTAL_INBOARD_M, y=max(ys) if len(ys) else 0,
+                text="Hull side", showarrow=False, yshift=10
+            )
+
+            # Layout
+            fig2.update_layout(
+                title=title_capacity,
+                xaxis_title="RADIUS (m)",
+                yaxis_title="SWL (t)",
+                hovermode="x unified",
+                xaxis=dict(rangeslider=dict(visible=True)),
+                template="plotly_white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            st.plotly_chart(fig2, use_container_width=True, config={
+                "displaylogo": False,
+                "modeBarButtonsToRemove": ["lasso2d"]
+            })
 
             env_csv = pd.DataFrame({"Radius_m": xs, "SWL_t": ys})
             st.download_button(
