@@ -288,3 +288,78 @@ def main():
             df_env=df_env,
             deck_offset=deck_offset,
             use_deck=use_deck,
+            target=target,
+            main_angle=main_angle,
+            fold_angle=fold_angle,
+            daf=daf,
+            chosen_env=chosen_env,
+            ox=ox, hz=hz
+        )
+        if fig_contour is not None:
+            st.plotly_chart(fig_contour, use_container_width=True, config={"displaylogo": False})
+
+        # ---- INTERACTIVE CAPACITY (Plotly) ----
+        st.markdown("### Interactive capacity chart")
+        xs, ys = capacity_envelope_vs_radius(df_env)
+
+        if len(xs) and len(ys):
+            fig2 = go.Figure()
+
+            # Envelope line
+            fig2.add_trace(go.Scatter(
+                x=xs, y=ys, mode="lines",
+                name="Envelope",
+                hovertemplate="Radius: %{x:.2f} m<br>SWL: %{y:.2f} t<extra></extra>"
+            ))
+
+            # Current point marker (if available)
+            if np.isfinite(ox) and np.isfinite(rated):
+                fig2.add_trace(go.Scatter(
+                    x=[ox], y=[rated], mode="markers",
+                    name="Current point",
+                    marker=dict(size=10),
+                    hovertemplate="Current point<br>Radius: %{x:.2f} m<br>SWL: %{y:.2f} t<extra></extra>"
+                ))
+
+            # Hull side vertical guide
+            fig2.add_shape(
+                type="line",
+                x0=PEDESTAL_INBOARD_M, x1=PEDESTAL_INBOARD_M,
+                y0=min(ys) if len(ys) else 0, y1=max(ys) if len(ys) else 1,
+                line=dict(dash="dash"),
+                xref="x", yref="y"
+            )
+            fig2.add_annotation(
+                x=PEDESTAL_INBOARD_M, y=max(ys) if len(ys) else 0,
+                text="Hull side", showarrow=False, yshift=10
+            )
+
+            title_capacity = f"Offshore Lift Capacity - {chosen_env} Cdyn {daf:.2f}" if np.isfinite(daf) else f"Offshore Lift Capacity - {chosen_env}"
+            fig2.update_layout(
+                title=title_capacity,
+                xaxis_title="RADIUS (m)",
+                yaxis_title="SWL (t)",
+                hovermode="x unified",
+                xaxis=dict(rangeslider=dict(visible=True)),
+                template="plotly_white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            st.plotly_chart(fig2, use_container_width=True, config={
+                "displaylogo": False,
+                "modeBarButtonsToRemove": ["lasso2d"]
+            })
+
+            env_csv = pd.DataFrame({"Radius_m": xs, "SWL_t": ys})
+            st.download_button(
+                "Download capacity curve CSV",
+                env_csv.to_csv(index=False).encode("utf-8"),
+                file_name=f"capacity_curve_{chosen_env}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No data available to build capacity curve for the selected environment.")
+
+
+if __name__ == "__main__":
+    main()
